@@ -30,11 +30,17 @@ android {
       keyAlias = "upload"
       keyPassword = System.getenv("KEY_PASSWORD")
     }
-    create("debugConfig") {
-      storeFile = file("${rootDir}/debug.keystore")
-      storePassword = "android"
-      keyAlias = "androiddebugkey"
-      keyPassword = "android"
+    // A debug build uses Android Gradle Plugin's standard debug keystore by default.
+    // CI can optionally provide a stable keystore through DEBUG_KEYSTORE_* environment variables
+    // so APKs from different workflow runs can update one another without uninstalling.
+    val debugKeystorePath = System.getenv("DEBUG_KEYSTORE_PATH")
+    if (!debugKeystorePath.isNullOrBlank()) {
+      create("ciDebug") {
+        storeFile = file(debugKeystorePath)
+        storePassword = System.getenv("DEBUG_STORE_PASSWORD")
+        keyAlias = System.getenv("DEBUG_KEY_ALIAS") ?: "androiddebugkey"
+        keyPassword = System.getenv("DEBUG_KEY_PASSWORD")
+      }
     }
   }
 
@@ -48,9 +54,11 @@ android {
       signingConfig = signingConfigs.getByName("release")
     }
     debug {
-      // Do not remove or modify this signingConfig assignment. It is necessary for Android apps in
-      // AI Studio.
-      signingConfig = signingConfigs.getByName("debugConfig")
+      // Keep AGP's default debug signing unless CI supplies a persistent debug keystore.
+      val debugKeystorePath = System.getenv("DEBUG_KEYSTORE_PATH")
+      if (!debugKeystorePath.isNullOrBlank()) {
+        signingConfig = signingConfigs.getByName("ciDebug")
+      }
     }
   }
   compileOptions {

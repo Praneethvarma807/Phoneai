@@ -41,24 +41,28 @@ jobs:
         with:
           gradle-version: '9.3.1'
 
-      - name: Prepare debug keystore for CI runner
+      # Optional: configure these repository secrets once to keep APK signing stable
+      # across workflow runs: DEBUG_KEYSTORE_BASE64, DEBUG_STORE_PASSWORD,
+      # DEBUG_KEY_ALIAS, and DEBUG_KEY_PASSWORD.
+      - name: Configure persistent debug signing (optional)
+        env:
+          DEBUG_KEYSTORE_BASE64: ${{ secrets.DEBUG_KEYSTORE_BASE64 }}
+          DEBUG_STORE_PASSWORD: ${{ secrets.DEBUG_STORE_PASSWORD }}
+          DEBUG_KEY_ALIAS: ${{ secrets.DEBUG_KEY_ALIAS }}
+          DEBUG_KEY_PASSWORD: ${{ secrets.DEBUG_KEY_PASSWORD }}
         run: |
-          if [ ! -f debug.keystore ]; then
-            if [ -f debug.keystore.base64 ]; then
-              base64 -d debug.keystore.base64 > debug.keystore
-            elif [ -f "$HOME/.android/debug.keystore" ]; then
-              cp "$HOME/.android/debug.keystore" debug.keystore
-            else
-              keytool -genkeypair -noprompt \
-                -keystore debug.keystore \
-                -storepass android \
-                -alias androiddebugkey \
-                -keypass android \
-                -keyalg RSA \
-                -keysize 2048 \
-                -validity 10000 \
-                -dname "CN=Android Debug,O=Android,C=US"
-            fi
+          if [ -n "$DEBUG_KEYSTORE_BASE64" ]; then
+            : "${DEBUG_STORE_PASSWORD:?Set DEBUG_STORE_PASSWORD when DEBUG_KEYSTORE_BASE64 is configured}"
+            : "${DEBUG_KEY_PASSWORD:?Set DEBUG_KEY_PASSWORD when DEBUG_KEYSTORE_BASE64 is configured}"
+            KEYSTORE_PATH="$RUNNER_TEMP/phoneai-debug.keystore"
+            printf '%s' "$DEBUG_KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE_PATH"
+            test -s "$KEYSTORE_PATH"
+            echo "DEBUG_KEYSTORE_PATH=$KEYSTORE_PATH" >> "$GITHUB_ENV"
+            echo "DEBUG_STORE_PASSWORD=$DEBUG_STORE_PASSWORD" >> "$GITHUB_ENV"
+            echo "DEBUG_KEY_ALIAS=${DEBUG_KEY_ALIAS:-androiddebugkey}" >> "$GITHUB_ENV"
+            echo "DEBUG_KEY_PASSWORD=$DEBUG_KEY_PASSWORD" >> "$GITHUB_ENV"
+          else
+            echo "::notice::No persistent debug keystore secret configured; Gradle will use its standard debug signing."
           fi
 
       - name: Run unit tests and build Debug APK
@@ -71,11 +75,14 @@ jobs:
             gradle testDebugUnitTest assembleDebug --stacktrace
           fi
 
-      - name: Verify Debug APK exists
+      - name: Verify Debug APK exists and signature is valid
         run: |
-          test -f app/build/outputs/apk/debug/app-debug.apk
-          test -s app/build/outputs/apk/debug/app-debug.apk
-          ls -lh app/build/outputs/apk/debug/app-debug.apk
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          APK="app/build/outputs/apk/debug/app-debug.apk"
+          test -f "$APK"
+          test -s "$APK"
+          ls -lh "$APK"
+          "$SDK_ROOT/build-tools/36.0.0/apksigner" verify --verbose "$APK"
 
       - name: Upload Debug APK artifact
         uses: actions/upload-artifact@v4

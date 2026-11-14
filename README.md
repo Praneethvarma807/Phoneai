@@ -17,12 +17,24 @@ A 100% API-key-free, offline-first Android AI phone automation assistant built w
 
 ## Build & Test Instructions
 
-```bash
-# Run unit & Robolectric tests
-./gradlew clean testDebugUnitTest
+### Build with Android Studio
 
-# Build debug APK (uses standard debug signing)
-./gradlew assembleDebug
+1. Open this folder in Android Studio (current stable version with Android SDK 36.1 support).
+2. Allow Gradle sync to finish and install the Android SDK platform/build-tools requested by the project.
+3. Select the `app` run configuration and run it on an Android 8.0+ device (API 26+).
+
+### Build from a terminal
+
+This source archive does not include the Gradle Wrapper scripts/JAR. If Gradle 9.3.1 is installed locally:
+
+```bash
+gradle clean testDebugUnitTest assembleDebug
 ```
 
 Output APK: `app/build/outputs/apk/debug/app-debug.apk`.
+
+### Installing updated APKs
+
+The package ID is `com.aistudio.aiphonecommander.kxmpzq`. Android only accepts an update when the installed app has the same package ID and signing certificate. If you build from a different machine or a GitHub Actions run without a persistent signing key, uninstall the older Phoneai app first (this deletes its local app data) and then install the new APK.
+
+For repeatable updates from GitHub Actions, add repository secrets `DEBUG_KEYSTORE_BASE64`, `DEBUG_STORE_PASSWORD`, `DEBUG_KEY_ALIAS`, and `DEBUG_KEY_PASSWORD` using one dedicated debug keystore. Never use this debug key to publish a production release.
