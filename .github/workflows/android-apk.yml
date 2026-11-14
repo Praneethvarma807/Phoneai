@@ -41,18 +41,34 @@ jobs:
         with:
           gradle-version: '9.3.1'
 
-      - name: Prepare debug keystore
+      - name: Prepare debug keystore for CI runner
         run: |
-          if [ ! -f debug.keystore ] && [ -f debug.keystore.base64 ]; then
-            base64 -d debug.keystore.base64 > debug.keystore
+          if [ ! -f debug.keystore ]; then
+            if [ -f debug.keystore.base64 ]; then
+              base64 -d debug.keystore.base64 > debug.keystore
+            elif [ -f "$HOME/.android/debug.keystore" ]; then
+              cp "$HOME/.android/debug.keystore" debug.keystore
+            else
+              keytool -genkeypair -noprompt \
+                -keystore debug.keystore \
+                -storepass android \
+                -alias androiddebugkey \
+                -keypass android \
+                -keyalg RSA \
+                -keysize 2048 \
+                -validity 10000 \
+                -dname "CN=Android Debug,O=Android,C=US"
+            fi
           fi
 
       - name: Run unit tests and build Debug APK
         run: |
           if [ -x ./gradlew ]; then
-            ./gradlew clean testDebugUnitTest assembleDebug --stacktrace
+            ./gradlew clean
+            ./gradlew testDebugUnitTest assembleDebug --stacktrace
           else
-            gradle clean testDebugUnitTest assembleDebug --stacktrace
+            gradle clean
+            gradle testDebugUnitTest assembleDebug --stacktrace
           fi
 
       - name: Verify Debug APK exists
