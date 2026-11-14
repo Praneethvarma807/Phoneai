@@ -8,6 +8,7 @@ import com.example.domain.model.LocalModelSpec
 import com.example.domain.model.ModelInstallStatus
 import java.io.File
 import java.io.FileOutputStream
+import java.io.IOException
 import java.security.MessageDigest
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
@@ -16,6 +17,8 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -48,6 +51,7 @@ class ModelDownloadManager(
     private val client = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
         .readTimeout(60, TimeUnit.SECONDS)
+        .writeTimeout(60, TimeUnit.SECONDS)
         .followRedirects(true)
         .followSslRedirects(true)
         .build()
@@ -85,69 +89,43 @@ class ModelDownloadManager(
                     return@launch
                 }
 
-                val existingBytes = if (partFile.exists()) partFile.length() else 0L
-                val requestBuilder = Request.Builder().url(spec.downloadUrl)
-                if (existingBytes > 0L) {
-                    requestBuilder.addHeader("Range", "bytes=$existingBytes-")
-                }
-
-                updateProgress(spec.id, existingBytes, spec.expectedSizeBytes, ModelInstallStatus.DOWNLOADING)
-                dao.upsert(
-                    DownloadedModelEntity(
-                        modelId = spec.id,
-                        displayName = spec.displayName,
-                        fileName = spec.fileName,
-                        localPath = finalFile.absolutePath,
-                        expectedSizeBytes = spec.expectedSizeBytes,
-                        downloadedBytes = existingBytes,
-                        status = ModelInstallStatus.DOWNLOADING.name
-                    )
-                )
-
-                client.newCall(requestBuilder.build()).execute().use { response ->
-                    if (!response.isSuccessful && response.code != 206) {
-                        throw IllegalStateException("HTTP ${response.code}: ${response.message}. Public download unavailable.")
-                    }
-                    val body = response.body ?: throw IllegalStateException("Empty response body")
-                    val append = response.code == 206 && existingBytes > 0L
-                    val startOffset = if (append) existingBytes else 0L
-                    val contentLen = body.contentLength()
-                    val totalSize = when {
-                        contentLen > 0L -> startOffset + contentLen
-                        else -> spec.expectedSizeBytes
-                    }
-
-                    body.byteStream().use { input ->
-                        FileOutputStream(partFile, append).use { output ->
-                            val buffer = ByteArray(64 * 1024)
-                            var downloaded = startOffset
-                            var lastEmit = 0L
-                            while (true) {
-                                val read = input.read(buffer)
-                                if (read == -1) break
-                                output.write(buffer, 0, read)
-                                downloaded += read
-                                val now = System.currentTimeMillis()
-                                if (now - lastEmit > 250L) {
-                                    lastEmit = now
-                                    updateProgress(spec.id, downloaded, totalSize, ModelInstallStatus.DOWNLOADING)
-                                }
-                            }
-                            output.flush()
+                var attempt = 0
+                var lastError: Exception? = null
+                while (attempt < MAX_RETRIES) {
+                    try {
+                        downloadOnce(spec, partFile, finalFile)
+                        lastError = null
+                        break
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: IOException) {
+                        lastError = e
+                        attempt++
+                        if (attempt < MAX_RETRIES) {
+                            val bytes = if (partFile.exists()) partFile.length() else 0L
+                            updateProgress(
+                                spec.id,
+                                bytes,
+                                spec.expectedSizeBytes,
+                                ModelInstallStatus.DOWNLOADING,
+                                "Connection interrupted; retrying ($attempt/$MAX_RETRIES)…"
+                            )
+                            delay(1500L * attempt)
                         }
                     }
-
-                    if (!validateDownloadedFile(partFile, spec)) {
-                        partFile.delete()
-                        throw IllegalStateException("Downloaded file failed validation check.")
-                    }
-                    if (finalFile.exists()) finalFile.delete()
-                    if (!partFile.renameTo(finalFile)) {
-                        partFile.copyTo(finalFile, overwrite = true)
-                        partFile.delete()
-                    }
-                    markReady(spec, finalFile)
                 }
+                if (lastError != null) throw lastError
+
+                if (!validateDownloadedFile(partFile, spec)) {
+                    partFile.delete()
+                    throw IllegalStateException("Downloaded file failed validation check.")
+                }
+                if (finalFile.exists()) finalFile.delete()
+                if (!partFile.renameTo(finalFile)) {
+                    partFile.copyTo(finalFile, overwrite = true)
+                    partFile.delete()
+                }
+                markReady(spec, finalFile)
             } catch (_: CancellationException) {
                 val bytes = if (partFile.exists()) partFile.length() else 0L
                 updateProgress(spec.id, bytes, spec.expectedSizeBytes, ModelInstallStatus.PAUSED)
@@ -182,6 +160,58 @@ class ModelDownloadManager(
             }
         }
         activeJobs[spec.id] = job
+    }
+
+    private suspend fun downloadOnce(spec: LocalModelSpec, partFile: File, finalFile: File) {
+        val existingBytes = if (partFile.exists()) partFile.length() else 0L
+        val requestBuilder = Request.Builder().url(spec.downloadUrl)
+        if (existingBytes > 0L) {
+            requestBuilder.addHeader("Range", "bytes=$existingBytes-")
+        }
+
+        updateProgress(spec.id, existingBytes, spec.expectedSizeBytes, ModelInstallStatus.DOWNLOADING)
+        dao.upsert(
+            DownloadedModelEntity(
+                modelId = spec.id,
+                displayName = spec.displayName,
+                fileName = spec.fileName,
+                localPath = finalFile.absolutePath,
+                expectedSizeBytes = spec.expectedSizeBytes,
+                downloadedBytes = existingBytes,
+                status = ModelInstallStatus.DOWNLOADING.name
+            )
+        )
+
+        client.newCall(requestBuilder.build()).execute().use { response ->
+            if (!response.isSuccessful && response.code != 206) {
+                throw IllegalStateException("HTTP ${response.code}: ${response.message}. Public download unavailable.")
+            }
+            val body = response.body ?: throw IllegalStateException("Empty response body")
+            val append = response.code == 206 && existingBytes > 0L
+            val startOffset = if (append) existingBytes else 0L
+            val contentLen = body.contentLength()
+            val totalSize = if (contentLen > 0L) startOffset + contentLen else spec.expectedSizeBytes
+
+            body.byteStream().use { input ->
+                FileOutputStream(partFile, append).use { output ->
+                    val buffer = ByteArray(64 * 1024)
+                    var downloaded = startOffset
+                    var lastEmit = 0L
+                    while (true) {
+                        val read = input.read(buffer)
+                        if (read == -1) break
+                        output.write(buffer, 0, read)
+                        downloaded += read
+                        val now = System.currentTimeMillis()
+                        if (now - lastEmit > 250L) {
+                            lastEmit = now
+                            updateProgress(spec.id, downloaded, totalSize, ModelInstallStatus.DOWNLOADING)
+                        }
+                    }
+                    output.flush()
+                }
+            }
+        }
     }
 
     fun pauseDownload(modelId: String) {
@@ -251,8 +281,13 @@ class ModelDownloadManager(
         _progress.update { it - modelId }
     }
 
-    fun getTotalStorageUsedBytes(): Long {
-        return modelsDir().listFiles()?.sumOf { it.length() } ?: 0L
+    suspend fun getTotalStorageUsedBytes(): Long = withContext(Dispatchers.IO) {
+        modelsDir().listFiles()?.sumOf { it.length() } ?: 0L
+    }
+
+    fun shutdown() {
+        activeJobs.values.forEach { it.cancel() }
+        scope.cancel()
     }
 
     private suspend fun markReady(spec: LocalModelSpec, file: File) {
@@ -304,5 +339,9 @@ class ModelDownloadManager(
         _progress.update {
             it + (modelId to DownloadProgressState(modelId, downloaded, total, status, error))
         }
+    }
+
+    companion object {
+        private const val MAX_RETRIES = 3
     }
 }

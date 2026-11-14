@@ -24,6 +24,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -38,6 +39,7 @@ import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Replay
 import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material.icons.filled.Translate
 import androidx.compose.material.icons.filled.VerifiedUser
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.AlertDialog
@@ -45,6 +47,7 @@ import androidx.compose.material3.AssistChip
 import androidx.compose.material3.AssistChipDefaults
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilledIconButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -58,6 +61,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -114,8 +118,15 @@ fun DashboardScreen(
     val ttsSpeaking by viewModel.ttsSpeaking.collectAsStateWithLifecycle()
     val ttsLevel by viewModel.ttsSpeechLevel.collectAsStateWithLifecycle()
     val recentCommands by viewModel.recentCommands.collectAsStateWithLifecycle()
+    val listState = rememberLazyListState()
 
     var commandInput by rememberSaveable { mutableStateOf("") }
+
+    LaunchedEffect(execState.currentCommand, execState.finalStatus) {
+        if (execState.pipelineStage != PipelineStage.IDLE || execState.finalReply.isNotBlank()) {
+            listState.animateScrollToItem(2)
+        }
+    }
 
     val micPermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
@@ -218,7 +229,10 @@ fun DashboardScreen(
                 .widthIn(max = 720.dp)
         ) {
             LazyColumn(
-                modifier = Modifier.weight(1f),
+                state = listState,
+                modifier = Modifier
+                    .weight(1f)
+                    .testTag("dashboard_lazy_column"),
                 contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
                 verticalArrangement = Arrangement.spacedBy(14.dp)
             ) {
@@ -388,14 +402,32 @@ fun DashboardScreen(
                     item {
                         val borderColor = execState.finalStatus?.let { statusColor(it) } ?: ElectricCyan
                         GlassCard(accentBorder = borderColor.copy(alpha = 0.7f)) {
-                            if (execState.currentCommand.isNotBlank()) {
-                                Text(
-                                    text = "COMMAND: ${execState.currentCommand}",
-                                    style = MaterialTheme.typography.labelMedium,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                if (execState.currentCommand.isNotBlank()) {
+                                    Text(
+                                        text = "COMMAND: ${execState.currentCommand}",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        modifier = Modifier.weight(1f),
+                                        maxLines = 2,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                } else {
+                                    Spacer(Modifier.weight(1f))
+                                }
+                                Spacer(Modifier.width(8.dp))
+                                StatusPill(
+                                    label = execState.detectedLanguageBadge,
+                                    color = NeuralViolet,
+                                    icon = Icons.Default.Translate,
+                                    modifier = Modifier.testTag("detected_language_pill")
                                 )
-                                Spacer(Modifier.height(6.dp))
                             }
+                            Spacer(Modifier.height(6.dp))
 
                             AnimatedStageIndicator(
                                 stage = execState.pipelineStage,
@@ -423,8 +455,25 @@ fun DashboardScreen(
                                     Text(
                                         text = execState.finalReply,
                                         style = MaterialTheme.typography.bodyLarge,
-                                        color = MaterialTheme.colorScheme.onSurface
+                                        color = MaterialTheme.colorScheme.onSurface,
+                                        modifier = Modifier.testTag("execution_reply_text")
                                     )
+                                }
+
+                                val canRetry = execState.finalStatus in setOf(
+                                    ExecutionStatus.FAILED,
+                                    ExecutionStatus.UNSUPPORTED
+                                ) && !execState.isExecuting && execState.currentCommand.isNotBlank()
+                                if (canRetry) {
+                                    Spacer(Modifier.height(8.dp))
+                                    OutlinedButton(
+                                        onClick = { viewModel.retryLastCommand() },
+                                        modifier = Modifier.testTag("retry_command_button")
+                                    ) {
+                                        Icon(Icons.Default.Replay, contentDescription = null, modifier = Modifier.size(16.dp))
+                                        Spacer(Modifier.width(6.dp))
+                                        Text("Retry Command")
+                                    }
                                 }
                             }
 
@@ -508,17 +557,19 @@ fun DashboardScreen(
                     }
                 }
 
-                // Quick Automation Chips (English + Tenglish + Multi-step)
+                // Quick Automation Chips (English + Indic Multilingual + Multi-step)
                 item {
                     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         Text(
-                            text = "QUICK COMMANDS",
+                            text = "QUICK COMMANDS (MULTILINGUAL)",
                             style = MaterialTheme.typography.labelMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                         val quickCommands = listOf(
                             "Open Chrome",
                             "YouTube lo Java tutorials search chey",
+                            "YouTube पर AI videos search करो",
+                            "Chrome திற",
                             "Open Bluetooth settings",
                             "Explain my screen",
                             "Create a reminder Call Alex",
@@ -660,7 +711,7 @@ fun DashboardScreen(
                             .weight(1f)
                             .testTag("command_input_field"),
                         placeholder = {
-                            Text("Type a command (EN / TE / HI)…", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            Text("Command (EN / TE / HI / TA / KN / ML)…", maxLines = 1, overflow = TextOverflow.Ellipsis)
                         },
                         singleLine = true,
                         shape = RoundedCornerShape(24.dp),
@@ -673,7 +724,7 @@ fun DashboardScreen(
                         keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
                         keyboardActions = KeyboardActions(
                             onSend = {
-                                if (commandInput.isNotBlank()) {
+                                if (commandInput.isNotBlank() && !execState.isExecuting) {
                                     viewModel.submitCommand(commandInput)
                                     commandInput = ""
                                 }
@@ -683,12 +734,12 @@ fun DashboardScreen(
 
                     FilledIconButton(
                         onClick = {
-                            if (commandInput.isNotBlank()) {
+                            if (commandInput.isNotBlank() && !execState.isExecuting) {
                                 viewModel.submitCommand(commandInput)
                                 commandInput = ""
                             }
                         },
-                        enabled = commandInput.isNotBlank(),
+                        enabled = commandInput.isNotBlank() && !execState.isExecuting,
                         colors = IconButtonDefaults.filledIconButtonColors(
                             containerColor = ElectricCyan,
                             contentColor = DeepSpaceBlack
@@ -697,10 +748,18 @@ fun DashboardScreen(
                             .size(48.dp)
                             .testTag("send_command_button")
                     ) {
-                        Icon(
-                            imageVector = Icons.AutoMirrored.Filled.Send,
-                            contentDescription = "Send command"
-                        )
+                        if (execState.isExecuting) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(20.dp),
+                                strokeWidth = 2.dp,
+                                color = DeepSpaceBlack
+                            )
+                        } else {
+                            Icon(
+                                imageVector = Icons.AutoMirrored.Filled.Send,
+                                contentDescription = "Send command"
+                            )
+                        }
                     }
                 }
             }

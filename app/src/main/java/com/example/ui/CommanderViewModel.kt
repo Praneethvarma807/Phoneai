@@ -9,6 +9,7 @@ import androidx.lifecycle.viewModelScope
 import com.example.CommanderApplication
 import com.example.ai.DownloadProgressState
 import com.example.ai.ExecutionUiState
+import com.example.ai.LanguageDetector
 import com.example.ai.ModelCatalog
 import com.example.data.local.CommandHistoryEntity
 import com.example.data.local.DownloadedModelEntity
@@ -25,14 +26,15 @@ import com.example.voice.ActivationSoundPlayer
 import com.example.voice.VoiceListeningState
 import com.example.voice.WakeWordEvent
 import com.example.voice.WakeWordForegroundService
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 data class PermissionStatusSnapshot(
     val microphoneGranted: Boolean = false,
@@ -90,8 +92,21 @@ class CommanderViewModel(application: Application) : AndroidViewModel(applicatio
         container.database.localReminderDao().observeAll()
             .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
-    private val _deviceCompatibility = MutableStateFlow(container.deviceCompatibilityManager.inspectDevice())
+    private val _deviceCompatibility = MutableStateFlow(
+        DeviceCompatibilityInfo(
+            totalRamMb = 0L,
+            availableRamMb = 0L,
+            availableStorageMb = 0L,
+            cpuAbi = "detecting…",
+            isArm64 = false,
+            supportsGpuAcceleration = false,
+            tier = com.example.domain.model.DeviceTier.LOW_RAM
+        )
+    )
     val deviceCompatibility: StateFlow<DeviceCompatibilityInfo> = _deviceCompatibility.asStateFlow()
+
+    private val _modelStorageUsedMb = MutableStateFlow(0L)
+    val modelStorageUsedMb: StateFlow<Long> = _modelStorageUsedMb.asStateFlow()
 
     private val _wakeBannerMessage = MutableStateFlow<String?>(null)
     val wakeBannerMessage: StateFlow<String?> = _wakeBannerMessage.asStateFlow()
@@ -103,10 +118,20 @@ class CommanderViewModel(application: Application) : AndroidViewModel(applicatio
     val registeredToolSchemas: List<ToolSchemaInfo> = container.toolRegistry.allSchemas()
 
     init {
+        refreshDeviceCompatibility()
+
         viewModelScope.launch {
             settings.collect { s ->
                 container.voiceOutputManager.configure(s.speechSpeed, s.selectedTtsVoice)
                 container.localLlmEngine.setCommandOnlyMode(s.commandOnlyMode)
+            }
+        }
+
+        // Keep model storage metric synced cleanly in background when models finish downloading or are deleted
+        viewModelScope.launch {
+            downloadedModels.collect {
+                val bytes = container.modelDownloadManager.getTotalStorageUsedBytes()
+                _modelStorageUsedMb.value = bytes / (1024L * 1024L)
             }
         }
 
@@ -124,13 +149,17 @@ class CommanderViewModel(application: Application) : AndroidViewModel(applicatio
     private fun handleWakeWordTriggered(event: WakeWordEvent.Detected) {
         viewModelScope.launch {
             val currentSettings = settings.value
+            val activeLang = currentSettings.speechLanguage.appLanguage
+                ?: executionState.value.activeConversationLanguage
             _wakeBannerMessage.value = "Hello Buddy detected (${event.confidenceNote})"
             container.commandOrchestrator.updateOrbState(OrbState.WAKE_WORD_DETECTED)
             if (currentSettings.activationSoundEnabled) {
                 ActivationSoundPlayer.playChime()
             }
             if (currentSettings.voiceResponseEnabled) {
-                container.voiceOutputManager.speak("Yes, I'm listening.") {
+                container.voiceOutputManager.setResponseLanguage(activeLang)
+                val greeting = LanguageDetector.localizedGreetingPrompt(activeLang)
+                container.voiceOutputManager.speak(greeting) {
                     startVoiceCapture(afterWakeWord = true)
                 }
             } else {
@@ -142,6 +171,10 @@ class CommanderViewModel(application: Application) : AndroidViewModel(applicatio
     fun submitCommand(command: String) {
         val trimmed = command.trim()
         if (trimmed.isBlank()) return
+        if (executionState.value.isExecuting) {
+            _snackbarMessage.value = "Command execution in progress…"
+            return
+        }
         viewModelScope.launch {
             container.commandOrchestrator.processCommand(
                 rawCommand = trimmed,
@@ -150,7 +183,18 @@ class CommanderViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
+    fun retryLastCommand() {
+        val last = executionState.value.currentCommand.trim()
+        if (last.isNotBlank()) {
+            submitCommand(last)
+        }
+    }
+
     fun startVoiceCapture(afterWakeWord: Boolean = false) {
+        if (executionState.value.isExecuting) {
+            _snackbarMessage.value = "Please wait for the current command to finish."
+            return
+        }
         val context = getApplication<Application>()
         if (wakeWordServiceRunning.value) {
             WakeWordForegroundService.pause(context)
@@ -209,10 +253,14 @@ class CommanderViewModel(application: Application) : AndroidViewModel(applicatio
         val context = getApplication<Application>()
         viewModelScope.launch {
             container.preferences.setWakeWordEnabled(enabled)
-            if (enabled) {
-                WakeWordForegroundService.start(context)
-            } else {
-                WakeWordForegroundService.stop(context)
+            runCatching {
+                if (enabled) {
+                    WakeWordForegroundService.start(context)
+                } else {
+                    WakeWordForegroundService.stop(context)
+                }
+            }.onFailure { err ->
+                _snackbarMessage.value = err.message ?: "Unable to toggle Wake Word service"
             }
         }
     }
@@ -247,7 +295,14 @@ class CommanderViewModel(application: Application) : AndroidViewModel(applicatio
 
     // Model Management
     fun refreshDeviceCompatibility() {
-        _deviceCompatibility.value = container.deviceCompatibilityManager.inspectDevice()
+        viewModelScope.launch {
+            val info = withContext(Dispatchers.IO) {
+                container.deviceCompatibilityManager.inspectDevice()
+            }
+            _deviceCompatibility.value = info
+            val bytes = container.modelDownloadManager.getTotalStorageUsedBytes()
+            _modelStorageUsedMb.value = bytes / (1024L * 1024L)
+        }
     }
 
     fun startOrResumeDownload(spec: LocalModelSpec) {
@@ -267,7 +322,10 @@ class CommanderViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun loadModel(entity: DownloadedModelEntity, preferGpu: Boolean) {
         viewModelScope.launch {
-            val compat = container.deviceCompatibilityManager.inspectDevice()
+            val compat = withContext(Dispatchers.IO) {
+                container.deviceCompatibilityManager.inspectDevice()
+            }
+            _deviceCompatibility.value = compat
             val spec = ModelCatalog.publicModels.firstOrNull { it.id == entity.modelId }
             val minRam = spec?.minRamMb ?: 3072L
             if (compat.totalRamMb < minRam) {
@@ -308,6 +366,7 @@ class CommanderViewModel(application: Application) : AndroidViewModel(applicatio
                 container.localLlmEngine.unloadModel()
             }
             container.modelDownloadManager.deleteModel(modelId)
+            refreshDeviceCompatibility()
             _snackbarMessage.value = "Model deleted from local storage."
         }
     }
@@ -324,6 +383,7 @@ class CommanderViewModel(application: Application) : AndroidViewModel(applicatio
     fun importLocalLlmModel(uri: Uri) {
         viewModelScope.launch {
             val res = container.modelDownloadManager.importLocalModel(uri)
+            refreshDeviceCompatibility()
             _snackbarMessage.value = res.fold(
                 onSuccess = { "Imported ${it.displayName} locally." },
                 onFailure = { it.message ?: "Import failed" }
@@ -336,9 +396,11 @@ class CommanderViewModel(application: Application) : AndroidViewModel(applicatio
             runCatching {
                 val context = getApplication<Application>()
                 val dest = java.io.File(context.filesDir, "hello_buddy_kws.tflite")
-                context.contentResolver.openInputStream(uri)?.use { input ->
-                    dest.outputStream().use { out -> input.copyTo(out) }
-                } ?: throw IllegalStateException("Cannot read selected .tflite file")
+                withContext(Dispatchers.IO) {
+                    context.contentResolver.openInputStream(uri)?.use { input ->
+                        dest.outputStream().use { out -> input.copyTo(out) }
+                    } ?: throw IllegalStateException("Cannot read selected .tflite file")
+                }
                 container.preferences.setKwsModelPath(dest.absolutePath)
             }.fold(
                 onSuccess = { _snackbarMessage.value = "Custom Hello Buddy .tflite KWS model installed locally." },
@@ -346,9 +408,6 @@ class CommanderViewModel(application: Application) : AndroidViewModel(applicatio
             )
         }
     }
-
-    fun getModelStorageUsedMb(): Long =
-        container.modelDownloadManager.getTotalStorageUsedBytes() / (1024L * 1024L)
 
     // Screen Capture Consent handoff
     fun onScreenCaptureResult(resultCode: Int, data: Intent?) {
@@ -370,7 +429,10 @@ class CommanderViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun clearAllHistory() {
-        viewModelScope.launch { container.database.commandHistoryDao().clearAll() }
+        viewModelScope.launch {
+            container.database.commandHistoryDao().clearAll()
+            _snackbarMessage.value = "Command history cleared."
+        }
     }
 
     suspend fun exportHistoryText(): String {
@@ -407,23 +469,35 @@ class CommanderViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun openAccessibilitySettings() {
         val context = getApplication<Application>()
-        context.startActivity(
-            Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        )
+        runCatching {
+            context.startActivity(
+                Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            )
+        }.onFailure {
+            _snackbarMessage.value = "Unable to open Accessibility settings on this device."
+        }
     }
 
     fun openWriteSettings() {
         val context = getApplication<Application>()
-        context.startActivity(
-            Intent(Settings.ACTION_MANAGE_WRITE_SETTINGS, Uri.parse("package:${context.packageName}"))
-                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        )
+        runCatching {
+            context.startActivity(
+                Intent(Settings.ACTION_MANAGE_WRITE_SETTINGS, Uri.parse("package:${context.packageName}"))
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            )
+        }.onFailure {
+            _snackbarMessage.value = "Unable to open Modify System Settings screen."
+        }
     }
 
     fun openOfflineSpeechSettings() {
         val context = getApplication<Application>()
-        val intent = Intent("com.android.settings.VOICE_INPUT_SETTINGS").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        val fallback = Intent(Settings.ACTION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        context.startActivity(if (intent.resolveActivity(context.packageManager) != null) intent else fallback)
+        runCatching {
+            val intent = Intent("com.android.settings.VOICE_INPUT_SETTINGS").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            val fallback = Intent(Settings.ACTION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            context.startActivity(if (intent.resolveActivity(context.packageManager) != null) intent else fallback)
+        }.onFailure {
+            _snackbarMessage.value = "Unable to open Voice Input settings."
+        }
     }
 }

@@ -8,6 +8,8 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInHorizontally
@@ -61,6 +63,7 @@ import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import com.example.ui.CommanderViewModel
+import com.example.ui.animations.rememberReducedMotion
 import com.example.ui.components.SpaceBackdrop
 import com.example.ui.screens.DashboardScreen
 import com.example.ui.screens.HistoryScreen
@@ -221,14 +224,27 @@ fun CommanderAppShell(
                     }
                 }
 
+                val reducedMotion = rememberReducedMotion()
                 Box(modifier = Modifier.weight(1f)) {
                     NavHost(
                         navController = navController,
                         startDestination = DashboardRoute,
-                        enterTransition = { fadeIn() + slideInHorizontally { it / 16 } },
-                        exitTransition = { fadeOut() + slideOutHorizontally { -it / 16 } },
-                        popEnterTransition = { fadeIn() + slideInHorizontally { -it / 16 } },
-                        popExitTransition = { fadeOut() + slideOutHorizontally { it / 16 } }
+                        enterTransition = {
+                            if (reducedMotion) fadeIn(tween(80))
+                            else fadeIn(tween(200)) + slideInHorizontally(tween(220, easing = FastOutSlowInEasing)) { it / 16 }
+                        },
+                        exitTransition = {
+                            if (reducedMotion) fadeOut(tween(80))
+                            else fadeOut(tween(180)) + slideOutHorizontally(tween(200)) { -it / 16 }
+                        },
+                        popEnterTransition = {
+                            if (reducedMotion) fadeIn(tween(80))
+                            else fadeIn(tween(200)) + slideInHorizontally(tween(220, easing = FastOutSlowInEasing)) { -it / 16 }
+                        },
+                        popExitTransition = {
+                            if (reducedMotion) fadeOut(tween(80))
+                            else fadeOut(tween(180)) + slideOutHorizontally(tween(200)) { it / 16 }
+                        }
                     ) {
                         composable<DashboardRoute> {
                             DashboardScreen(

@@ -10,10 +10,12 @@ import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 import com.example.domain.model.SpeechLanguageOption
+import java.util.Locale
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -39,6 +41,7 @@ class VoiceRecognitionManager(context: Context) {
 
     private var recognizer: SpeechRecognizer? = null
     private var timerJob: Job? = null
+    private var timeoutJob: Job? = null
     private var startedAtMs: Long = 0L
 
     private val _state = MutableStateFlow(checkCapabilities())
@@ -65,7 +68,8 @@ class VoiceRecognitionManager(context: Context) {
     fun startListening(
         language: SpeechLanguageOption,
         onResult: (String) -> Unit,
-        onError: (String) -> Unit
+        onError: (String) -> Unit,
+        allowBusyRetry: Boolean = true
     ) {
         mainHandler.post {
             val caps = checkCapabilities()
@@ -77,6 +81,7 @@ class VoiceRecognitionManager(context: Context) {
             }
 
             destroyRecognizerInternal()
+            stopTimers()
 
             val sr = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
                 SpeechRecognizer.isOnDeviceRecognitionAvailable(appContext)
@@ -87,19 +92,18 @@ class VoiceRecognitionManager(context: Context) {
             }
             recognizer = sr
 
-            val localeTag = when (language) {
-                SpeechLanguageOption.AUTO -> "en-IN"
-                SpeechLanguageOption.EN_IN -> "en-IN"
-                SpeechLanguageOption.TE_IN -> "te-IN"
-                SpeechLanguageOption.HI_IN -> "hi-IN"
-            }
-
+            val localeTag = resolveLocaleTag(language)
             val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
                 putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
                 putExtra(RecognizerIntent.EXTRA_LANGUAGE, localeTag)
+                putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, localeTag)
                 putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
                 putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
-                putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
+                putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5)
+                // Support varied speaking speeds & pauses between regional + English words
+                putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 2200L)
+                putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 1600L)
+                putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 1500L)
             }
 
             sr.setRecognitionListener(object : RecognitionListener {
@@ -113,7 +117,7 @@ class VoiceRecognitionManager(context: Context) {
                             error = null
                         )
                     }
-                    startDurationTimer()
+                    startTimers(language, onError)
                 }
 
                 override fun onBeginningOfSpeech() {}
@@ -126,12 +130,20 @@ class VoiceRecognitionManager(context: Context) {
                 override fun onBufferReceived(buffer: ByteArray?) {}
 
                 override fun onEndOfSpeech() {
-                    stopDurationTimer()
+                    stopTimers()
                     _state.update { it.copy(isListening = false, rmsNormalized = 0f) }
                 }
 
                 override fun onError(error: Int) {
-                    stopDurationTimer()
+                    stopTimers()
+                    if (error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY && allowBusyRetry) {
+                        destroyRecognizerInternal()
+                        scope.launch {
+                            delay(250L)
+                            startListening(language, onResult, onError, allowBusyRetry = false)
+                        }
+                        return
+                    }
                     val msg = mapSpeechError(error, language)
                     _state.update {
                         it.copy(
@@ -144,9 +156,9 @@ class VoiceRecognitionManager(context: Context) {
                 }
 
                 override fun onResults(results: Bundle?) {
-                    stopDurationTimer()
+                    stopTimers()
                     val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION).orEmpty()
-                    val transcript = matches.firstOrNull()?.trim().orEmpty()
+                    val transcript = pickBestTranscript(matches)
                     _state.update {
                         it.copy(
                             isListening = false,
@@ -179,10 +191,32 @@ class VoiceRecognitionManager(context: Context) {
         }
     }
 
+    fun resolveLocaleTag(language: SpeechLanguageOption): String = when (language) {
+        SpeechLanguageOption.AUTO -> {
+            val sysTag = Locale.getDefault().toLanguageTag()
+            when {
+                sysTag.startsWith("te", ignoreCase = true) -> "te-IN"
+                sysTag.startsWith("hi", ignoreCase = true) -> "hi-IN"
+                sysTag.startsWith("ta", ignoreCase = true) -> "ta-IN"
+                sysTag.startsWith("kn", ignoreCase = true) -> "kn-IN"
+                sysTag.startsWith("ml", ignoreCase = true) -> "ml-IN"
+                else -> "en-IN"
+            }
+        }
+        else -> language.code
+    }
+
+    internal fun pickBestTranscript(candidates: List<String>): String {
+        val clean = candidates.map { it.trim() }.filter { it.isNotBlank() }
+        if (clean.isEmpty()) return ""
+        // Prefer non-empty longest/cleanest hypothesis when multiple regional n-best candidates exist
+        return clean.first()
+    }
+
     fun stopListening() {
         mainHandler.post {
             runCatching { recognizer?.stopListening() }
-            stopDurationTimer()
+            stopTimers()
             _state.update { it.copy(isListening = false, rmsNormalized = 0f) }
         }
     }
@@ -191,7 +225,7 @@ class VoiceRecognitionManager(context: Context) {
         mainHandler.post {
             runCatching { recognizer?.cancel() }
             destroyRecognizerInternal()
-            stopDurationTimer()
+            stopTimers()
             _state.update { it.copy(isListening = false, rmsNormalized = 0f, partialTranscript = "") }
         }
     }
@@ -201,7 +235,7 @@ class VoiceRecognitionManager(context: Context) {
         recognizer = null
     }
 
-    private fun startDurationTimer() {
+    private fun startTimers(language: SpeechLanguageOption, onError: (String) -> Unit) {
         timerJob?.cancel()
         timerJob = scope.launch {
             while (_state.value.isListening) {
@@ -209,10 +243,19 @@ class VoiceRecognitionManager(context: Context) {
                 delay(100L)
             }
         }
+        timeoutJob?.cancel()
+        timeoutJob = scope.launch {
+            delay(RECOGNITION_HARD_TIMEOUT_MS)
+            if (_state.value.isListening) {
+                cancelListening()
+                onError("Voice capture timed out for ${language.displayName}. Please retry or type your command.")
+            }
+        }
     }
 
-    private fun stopDurationTimer() {
+    private fun stopTimers() {
         timerJob?.cancel()
+        timeoutJob?.cancel()
     }
 
     private fun mapSpeechError(code: Int, language: SpeechLanguageOption): String = when (code) {
@@ -230,5 +273,10 @@ class VoiceRecognitionManager(context: Context) {
 
     fun shutdown() {
         cancelListening()
+        scope.cancel()
+    }
+
+    companion object {
+        private const val RECOGNITION_HARD_TIMEOUT_MS = 22_000L
     }
 }

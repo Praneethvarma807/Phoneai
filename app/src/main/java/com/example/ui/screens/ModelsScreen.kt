@@ -67,6 +67,7 @@ fun ModelsScreen(
     val settings by viewModel.settings.collectAsStateWithLifecycle()
     val downloads by viewModel.downloadProgress.collectAsStateWithLifecycle()
     val installedEntities by viewModel.downloadedModels.collectAsStateWithLifecycle()
+    val modelStorageUsedMb by viewModel.modelStorageUsedMb.collectAsStateWithLifecycle()
 
     LaunchedEffect(Unit) {
         viewModel.refreshDeviceCompatibility()
@@ -117,7 +118,7 @@ fun ModelsScreen(
                         style = MaterialTheme.typography.bodyMedium
                     )
                     Text(
-                        text = "Storage: ${compat.availableStorageMb} MB free • Models using ${viewModel.getModelStorageUsedMb()} MB",
+                        text = "Storage: ${compat.availableStorageMb} MB free • Models using $modelStorageUsedMb MB",
                         style = MaterialTheme.typography.bodyMedium
                     )
                     Text(

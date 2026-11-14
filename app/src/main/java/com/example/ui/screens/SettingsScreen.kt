@@ -70,6 +70,7 @@ fun SettingsScreen(
     val wakeRunning by viewModel.wakeWordServiceRunning.collectAsStateWithLifecycle()
     val voiceState by viewModel.voiceListeningState.collectAsStateWithLifecycle()
     val ttsVoices by viewModel.ttsVoices.collectAsStateWithLifecycle()
+    val execState by viewModel.executionState.collectAsStateWithLifecycle()
     val accessibilityActive by CommanderAccessibilityService.activeService.collectAsStateWithLifecycle()
 
     var voiceMenuExpanded by remember { mutableStateOf(false) }
@@ -104,7 +105,8 @@ fun SettingsScreen(
         LazyColumn(
             modifier = Modifier
                 .fillMaxSize()
-                .widthIn(max = 720.dp),
+                .widthIn(max = 720.dp)
+                .testTag("settings_lazy_column"),
             contentPadding = PaddingValues(16.dp),
             verticalArrangement = Arrangement.spacedBy(14.dp)
         ) {
@@ -226,35 +228,51 @@ fun SettingsScreen(
             // Voice & Language Section
             item {
                 GlassCard {
-                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Icon(Icons.Default.RecordVoiceOver, contentDescription = null, tint = NeuralViolet)
-                        Text("Voice & Multilingual Recognition", style = MaterialTheme.typography.titleMedium)
-                    }
-                    Spacer(Modifier.height(8.dp))
                     Row(
                         modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        SpeechLanguageOption.entries.take(2).forEach { lang ->
-                            FilterChip(
-                                selected = settings.speechLanguage == lang,
-                                onClick = { viewModel.setSpeechLanguage(lang) },
-                                label = { Text(lang.displayName) },
-                                modifier = Modifier.weight(1f)
-                            )
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Icon(Icons.Default.RecordVoiceOver, contentDescription = null, tint = NeuralViolet)
+                            Text("Voice & Multilingual Recognition", style = MaterialTheme.typography.titleMedium)
                         }
+                        StatusPill(
+                            label = "Active: ${execState.activeConversationLanguage.displayName}",
+                            color = ElectricCyan
+                        )
                     }
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        SpeechLanguageOption.entries.drop(2).forEach { lang ->
-                            FilterChip(
-                                selected = settings.speechLanguage == lang,
-                                onClick = { viewModel.setSpeechLanguage(lang) },
-                                label = { Text(lang.displayName) },
-                                modifier = Modifier.weight(1f)
-                            )
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        text = "Auto mode detects English, Telugu, Hindi, Tamil, Kannada, Malayalam & mixed-language speech/text dynamically.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        SpeechLanguageOption.entries.chunked(2).forEach { pair ->
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                pair.forEach { lang ->
+                                    FilterChip(
+                                        selected = settings.speechLanguage == lang,
+                                        onClick = { viewModel.setSpeechLanguage(lang) },
+                                        label = { Text(lang.displayName, maxLines = 1) },
+                                        modifier = Modifier
+                                            .weight(1f)
+                                            .testTag("lang_chip_${lang.name}")
+                                    )
+                                }
+                                if (pair.size == 1) {
+                                    Spacer(Modifier.weight(1f))
+                                }
+                            }
                         }
                     }
 

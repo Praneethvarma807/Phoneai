@@ -2,6 +2,8 @@ package com.example.ai
 
 import android.content.Context
 import com.example.domain.model.ActionPlan
+import com.example.domain.model.ConversationTurn
+import com.example.domain.model.LanguageDetectionResult
 import com.example.domain.model.ModelRuntimeState
 import com.example.domain.model.ToolCallRequest
 import com.example.domain.model.ToolSchemaInfo
@@ -16,6 +18,7 @@ import java.io.File
 import java.util.concurrent.Executors
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
@@ -27,9 +30,12 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.booleanOrNull
+import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
@@ -146,7 +152,9 @@ class LocalLlmEngine(
 
     suspend fun planCommand(
         userInput: String,
-        registeredTools: Set<String>
+        registeredTools: Set<String>,
+        languageInfo: LanguageDetectionResult = LanguageDetector.detect(userInput),
+        recentTurns: List<ConversationTurn> = emptyList()
     ): Result<ActionPlan> = withContext(engineDispatcher) {
         mutex.withLock {
             val activeConversation = conversation
@@ -156,19 +164,38 @@ class LocalLlmEngine(
             isGenerating = true
             try {
                 val prompt = buildString {
+                    if (recentTurns.isNotEmpty()) {
+                        appendLine("Recent conversation context (preserve topic/language if relevant):")
+                        recentTurns.takeLast(4).forEach { turn ->
+                            appendLine("- ${turn.role} (${turn.language.shortBadge}): ${turn.text.take(120)}")
+                        }
+                    }
+                    appendLine("Detected user language: ${languageInfo.primaryLanguage.displayName} (badge=${languageInfo.badgeLabel})")
+                    appendLine("Required assistant_reply language: ${languageInfo.responseLanguage.displayName}")
                     appendLine("User command: \"$userInput\"")
-                    appendLine("Respond ONLY with valid JSON matching the ActionPlan schema.")
+                    appendLine("Never invent facts or pretend a tool succeeded. Respond ONLY with valid JSON matching the ActionPlan schema.")
                 }
                 val rawBuffer = StringBuilder()
-                activeConversation.sendMessageAsync(prompt).collect { chunk ->
-                    rawBuffer.append(chunk.toString())
+                withTimeout(INFERENCE_TIMEOUT_MS) {
+                    activeConversation.sendMessageAsync(prompt).collect { chunk ->
+                        rawBuffer.append(chunk.toString())
+                    }
                 }
                 val parsed = JsonPlanParser.parse(rawBuffer.toString(), registeredTools)
                 if (parsed != null) {
-                    Result.success(parsed.copy(engineUsed = "LOCAL_LLM (${_runtimeState.value.loadedModelName ?: "LiteRT-LM"})"))
+                    Result.success(
+                        parsed.copy(
+                            engineUsed = "LOCAL_LLM (${_runtimeState.value.loadedModelName ?: "LiteRT-LM"})",
+                            detectedLanguage = languageInfo.badgeLabel,
+                            responseLanguage = languageInfo.responseLanguage.shortBadge
+                        )
+                    )
                 } else {
                     Result.failure(IllegalStateException("Model output was not a valid JSON action plan"))
                 }
+            } catch (_: TimeoutCancellationException) {
+                runCatching { activeConversation.cancelProcess() }
+                Result.failure(IllegalStateException("Local AI response timed out after ${INFERENCE_TIMEOUT_MS / 1000}s; falling back safely."))
             } catch (e: Exception) {
                 Result.failure(e)
             } finally {
@@ -186,10 +213,15 @@ class LocalLlmEngine(
             isGenerating = true
             try {
                 val sb = StringBuilder()
-                activeConversation.sendMessageAsync(prompt).collect { chunk ->
-                    sb.append(chunk.toString())
+                withTimeout(INFERENCE_TIMEOUT_MS) {
+                    activeConversation.sendMessageAsync(prompt).collect { chunk ->
+                        sb.append(chunk.toString())
+                    }
                 }
                 Result.success(sb.toString().trim())
+            } catch (_: TimeoutCancellationException) {
+                runCatching { activeConversation.cancelProcess() }
+                Result.failure(IllegalStateException("Local summarization timed out."))
             } catch (e: Exception) {
                 Result.failure(e)
             } finally {
@@ -241,12 +273,18 @@ class LocalLlmEngine(
 
     private fun buildSystemPrompt(schemas: List<ToolSchemaInfo>): String = buildString {
         appendLine("You are AI Phone Commander, an offline on-device Android automation planner.")
-        appendLine("Never output arbitrary code. Output ONLY a single JSON object with keys:")
+        appendLine("Never output arbitrary code. Never fabricate results for actions not performed by tools.")
+        appendLine("Respond in the same language the user used (English, Telugu, Hindi, Tamil, Kannada, or Malayalam) unless asked to switch.")
+        appendLine("Output ONLY a single JSON object with keys:")
         appendLine("""{"intent":"string","interpretation":"string","steps":["string"],"tool_calls":[{"tool":"tool_name","arguments":{"key":"value"}}],"requires_confirmation":false,"confirmation_prompt":null,"assistant_reply":"string"}""")
         appendLine("Available tools:")
         schemas.forEach { schema ->
             appendLine("- ${schema.name}: ${schema.description} | params=${schema.parameters} | confirm=${schema.requiresConfirmation}")
         }
+    }
+
+    companion object {
+        private const val INFERENCE_TIMEOUT_MS = 45_000L
     }
 }
 
@@ -261,19 +299,23 @@ object JsonPlanParser {
 
         return runCatching {
             val root: JsonObject = json.parseToJsonElement(jsonSlice).jsonObject
-            val intent = root["intent"]?.jsonPrimitive?.content ?: "general_command"
-            val interpretation = root["interpretation"]?.jsonPrimitive?.content ?: intent
-            val steps = root["steps"]?.jsonArray?.mapNotNull { it.jsonPrimitive.content } ?: emptyList()
-            val requiresConfirmation = root["requires_confirmation"]?.jsonPrimitive?.booleanOrNull ?: false
-            val confirmationPrompt = root["confirmation_prompt"]?.jsonPrimitive?.content
-            val reply = root["assistant_reply"]?.jsonPrimitive?.content ?: ""
+            val intent = root["intent"]?.takeUnless { it is JsonNull }?.jsonPrimitive?.contentOrNull ?: "general_command"
+            val interpretation = root["interpretation"]?.takeUnless { it is JsonNull }?.jsonPrimitive?.contentOrNull ?: intent
+            val steps = root["steps"]?.jsonArray?.mapNotNull {
+                it.takeUnless { el -> el is JsonNull }?.jsonPrimitive?.contentOrNull
+            } ?: emptyList()
+            val requiresConfirmation = root["requires_confirmation"]?.takeUnless { it is JsonNull }?.jsonPrimitive?.booleanOrNull ?: false
+            val confirmationPrompt = root["confirmation_prompt"]?.takeUnless { it is JsonNull }?.jsonPrimitive?.contentOrNull
+            val reply = root["assistant_reply"]?.takeUnless { it is JsonNull }?.jsonPrimitive?.contentOrNull ?: ""
             val calls = root["tool_calls"]?.jsonArray?.mapNotNull { el ->
                 val obj = el.jsonObject
-                val toolName = obj["tool"]?.jsonPrimitive?.content ?: return@mapNotNull null
+                val toolName = obj["tool"]?.takeUnless { it is JsonNull }?.jsonPrimitive?.contentOrNull ?: return@mapNotNull null
                 if (toolName !in allowedTools) return@mapNotNull null
-                val argsMap = obj["arguments"]?.jsonObject?.mapValues { (_, v) ->
-                    v.jsonPrimitive.content
-                } ?: emptyMap()
+                val argsMap = obj["arguments"]?.takeUnless { it is JsonNull }?.jsonObject
+                    ?.mapNotNull { (k, v) ->
+                        val str = v.takeUnless { it is JsonNull }?.jsonPrimitive?.contentOrNull ?: return@mapNotNull null
+                        k to str
+                    }?.toMap() ?: emptyMap()
                 ToolCallRequest(tool = toolName, arguments = argsMap)
             } ?: emptyList()
 

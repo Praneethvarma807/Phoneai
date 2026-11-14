@@ -12,6 +12,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.coroutines.resume
 
 data class ScreenAnalysisReport(
@@ -50,6 +51,7 @@ class ScreenUnderstandingManager(
 
         var ocrText = ""
         var sourceLabel = ""
+        var timedOut = false
 
         if (resultCode != null && resultData != null) {
             val deferred = CompletableDeferred<Bitmap?>()
@@ -58,9 +60,26 @@ class ScreenUnderstandingManager(
                 putExtra(ScreenCaptureService.EXTRA_RESULT_CODE, resultCode)
                 putExtra(ScreenCaptureService.EXTRA_RESULT_DATA, resultData)
             }
-            ContextCompat.startForegroundService(context, serviceIntent)
-            val bitmap = deferred.await()
-            // Clear single-use MediaProjection grant after capture on Android 14+
+            val started = runCatching {
+                ContextCompat.startForegroundService(context, serviceIntent)
+            }.isSuccess
+
+            val bitmap = if (started) {
+                withTimeoutOrNull(12_000L) {
+                    deferred.await()
+                }
+            } else {
+                null
+            }
+
+            if (bitmap == null && started) {
+                timedOut = ScreenCaptureService.pendingCapture === deferred
+                if (ScreenCaptureService.pendingCapture === deferred) {
+                    ScreenCaptureService.pendingCapture = null
+                }
+            }
+
+            // Clear single-use MediaProjection grant after capture attempt on Android 14+
             lastProjectionResultCode = null
             lastProjectionData = null
 
@@ -85,11 +104,12 @@ class ScreenUnderstandingManager(
         }.trim()
 
         if (combinedText.isBlank()) {
-            return@withContext Result.failure(
-                IllegalStateException(
-                    "No screen text captured. Grant Screen Capture permission or enable Accessibility Service."
-                )
-            )
+            val msg = if (timedOut) {
+                "Screen capture timed out after 12 seconds. Grant Screen Capture permission again or enable Accessibility Service."
+            } else {
+                "No screen text captured. Grant Screen Capture permission or enable Accessibility Service."
+            }
+            return@withContext Result.failure(IllegalStateException(msg))
         }
 
         val suggestions = deriveSuggestedActions(combinedText, accessibilitySnapshot)
@@ -109,10 +129,10 @@ class ScreenUnderstandingManager(
         val image = InputImage.fromBitmap(bitmap, 0)
         textRecognizer.process(image)
             .addOnSuccessListener { visionText ->
-                cont.resume(visionText.text.trim())
+                if (cont.isActive) cont.resume(visionText.text.trim())
             }
             .addOnFailureListener {
-                cont.resume("")
+                if (cont.isActive) cont.resume("")
             }
     }
 
@@ -152,5 +172,9 @@ class ScreenUnderstandingManager(
         }
         suggestions.add("Create a local note from this screen")
         return suggestions.distinct().take(4)
+    }
+
+    fun close() {
+        runCatching { textRecognizer.close() }
     }
 }

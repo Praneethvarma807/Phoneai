@@ -23,15 +23,22 @@ import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Replay
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Share
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -46,6 +53,7 @@ import com.example.ui.components.StatusPill
 import com.example.ui.components.statusColor
 import com.example.ui.theme.CrimsonAlert
 import com.example.ui.theme.ElectricCyan
+import com.example.ui.theme.MidnightNavy
 import java.text.DateFormat
 import java.util.Date
 import kotlinx.coroutines.launch
@@ -60,6 +68,33 @@ fun HistoryScreen(
     val scope = rememberCoroutineScope()
     val entries by viewModel.historyEntries.collectAsStateWithLifecycle()
     val query by viewModel.historySearch.collectAsStateWithLifecycle()
+    var showClearDialog by remember { mutableStateOf(false) }
+
+    if (showClearDialog) {
+        AlertDialog(
+            onDismissRequest = { showClearDialog = false },
+            containerColor = MidnightNavy,
+            title = { Text("Clear Command History?") },
+            text = { Text("This removes all locally saved command logs from Room SQLite on your device.") },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        showClearDialog = false
+                        viewModel.clearAllHistory()
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = CrimsonAlert),
+                    modifier = Modifier.testTag("confirm_clear_history_button")
+                ) {
+                    Text("Clear All")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showClearDialog = false }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
 
     Box(modifier = modifier.fillMaxSize(), contentAlignment = Alignment.TopCenter) {
         Column(
@@ -74,7 +109,7 @@ fun HistoryScreen(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Column {
+                Column(modifier = Modifier.weight(1f)) {
                     Text("Command History", style = MaterialTheme.typography.headlineMedium)
                     Text(
                         text = "Stored strictly on-device in Room SQLite (${entries.size} entries)",
@@ -91,7 +126,9 @@ fun HistoryScreen(
                                     type = "text/plain"
                                     putExtra(Intent.EXTRA_TEXT, exported)
                                 }
-                                context.startActivity(Intent.createChooser(sendIntent, "Export Command History"))
+                                runCatching {
+                                    context.startActivity(Intent.createChooser(sendIntent, "Export Command History"))
+                                }
                             }
                         },
                         enabled = entries.isNotEmpty(),
@@ -100,7 +137,7 @@ fun HistoryScreen(
                         Icon(Icons.Default.Share, contentDescription = "Export history", tint = ElectricCyan)
                     }
                     IconButton(
-                        onClick = { viewModel.clearAllHistory() },
+                        onClick = { showClearDialog = true },
                         enabled = entries.isNotEmpty(),
                         modifier = Modifier.testTag("clear_history_button")
                     ) {

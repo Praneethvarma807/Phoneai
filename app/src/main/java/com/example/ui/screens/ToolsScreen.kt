@@ -117,17 +117,17 @@ fun ToolsScreen(
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         OutlinedButton(
                             onClick = { viewModel.openAccessibilitySettings() },
-                            modifier = Modifier.testTag("tools_accessibility_button")
+                            modifier = Modifier.weight(1f).testTag("tools_accessibility_button")
                         ) {
-                            Text(if (accessibilityActive != null) "Manage Accessibility" else "Enable Accessibility")
+                            Text(if (accessibilityActive != null) "Accessibility" else "Enable Access.", maxLines = 1)
                         }
                         Button(
                             onClick = onRequestScreenCapture,
-                            modifier = Modifier.testTag("tools_explain_screen_button")
+                            modifier = Modifier.weight(1f).testTag("tools_explain_screen_button")
                         ) {
                             Icon(Icons.Default.Screenshot, contentDescription = null, modifier = Modifier.size(18.dp))
                             Spacer(Modifier.width(6.dp))
-                            Text("Explain Screen")
+                            Text("Explain Screen", maxLines = 1)
                         }
                     }
                     Spacer(Modifier.height(8.dp))

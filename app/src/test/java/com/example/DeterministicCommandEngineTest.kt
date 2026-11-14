@@ -115,4 +115,40 @@ class DeterministicCommandEngineTest {
         val plan = engine.parse("Philosophically compare quantum gravity theories")
         assertNull(plan)
     }
+
+    @Test
+    fun `test 13 multilingual commands in native scripts parse accurately`() {
+        val teVolume = engine.parse("వాల్యూమ్ పెంచు")
+        assertNotNull(teVolume)
+        assertEquals("adjust_volume", teVolume!!.toolCalls.first().tool)
+        assertEquals(com.example.domain.model.AppLanguage.TELUGU.shortBadge, teVolume.detectedLanguage)
+
+        val hiSearch = engine.parse("यूट्यूब पर Kotlin tutorials खोजो")
+        assertNotNull(hiSearch)
+        assertEquals("open_url", hiSearch!!.toolCalls.first().tool)
+        assertEquals("${com.example.domain.model.AppLanguage.HINDI.shortBadge} + ${com.example.domain.model.AppLanguage.ENGLISH.shortBadge}", hiSearch.detectedLanguage)
+
+        val taOpen = engine.parse("Chrome திற")
+        assertNotNull(taOpen)
+        assertEquals("open_app", taOpen!!.toolCalls.first().tool)
+        assertEquals("Chrome", taOpen.toolCalls.first().arguments["app_name"])
+
+        val knBrightness = engine.parse("ಬ್ರೈಟ್ನೆಸ್ 70 ಪರ್ಸೆಂಟ್ ಸೆಟ್ ಮಾಡು")
+        assertNotNull(knBrightness)
+        assertEquals("adjust_brightness", knBrightness!!.toolCalls.first().tool)
+        assertEquals("70", knBrightness.toolCalls.first().arguments["level"])
+
+        val mlPlan = engine.parse("ബ്ലൂടൂത്ത് തുറക്കൂ")
+        assertNotNull(mlPlan)
+        assertEquals("open_settings", mlPlan!!.toolCalls.first().tool)
+    }
+
+    @Test
+    fun `test 14 explicit language switch request returns zero-tool acknowledgment plan`() {
+        val plan = engine.parse("Reply in Telugu please")
+        assertNotNull(plan)
+        assertTrue(plan!!.toolCalls.isEmpty())
+        assertEquals(com.example.domain.model.AppLanguage.TELUGU.shortBadge, plan.responseLanguage)
+        assertTrue(plan.assistantReply.contains("తెలుగు"))
+    }
 }

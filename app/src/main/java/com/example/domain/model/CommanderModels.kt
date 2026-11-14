@@ -1,7 +1,6 @@
 package com.example.domain.model
 
 import kotlinx.serialization.Serializable
-import kotlinx.serialization.json.JsonObject
 
 @Serializable
 enum class ExecutionStatus {
@@ -49,6 +48,44 @@ enum class ActionCategory {
     APP_LAUNCH
 }
 
+enum class AppLanguage(
+    val bcp47: String,
+    val displayName: String,
+    val shortBadge: String,
+    val nativeName: String
+) {
+    ENGLISH("en-IN", "English", "EN", "English"),
+    TELUGU("te-IN", "Telugu", "TE", "తెలుగు"),
+    HINDI("hi-IN", "Hindi", "HI", "हिन्दी"),
+    TAMIL("ta-IN", "Tamil", "TA", "தமிழ்"),
+    KANNADA("kn-IN", "Kannada", "KN", "ಕನ್ನಡ"),
+    MALAYALAM("ml-IN", "Malayalam", "ML", "മലയാളം"),
+    UNSUPPORTED("en-IN", "Other / Unsupported", "OTHER", "Other")
+}
+
+data class LanguageDetectionResult(
+    val primaryLanguage: AppLanguage,
+    val secondaryLanguage: AppLanguage? = null,
+    val isMixed: Boolean = false,
+    val explicitRequestedLanguage: AppLanguage? = null,
+    val bcp47Tag: String = primaryLanguage.bcp47,
+    val confidence: Float = 1.0f,
+    val badgeLabel: String = if (isMixed && secondaryLanguage != null) {
+        "${primaryLanguage.shortBadge} + ${secondaryLanguage.shortBadge}"
+    } else {
+        primaryLanguage.shortBadge
+    }
+) {
+    val responseLanguage: AppLanguage
+        get() = explicitRequestedLanguage ?: primaryLanguage
+}
+
+data class ConversationTurn(
+    val role: String,
+    val text: String,
+    val language: AppLanguage
+)
+
 @Serializable
 data class ToolCallRequest(
     val tool: String,
@@ -64,7 +101,9 @@ data class ActionPlan(
     val requiresConfirmation: Boolean = false,
     val confirmationPrompt: String? = null,
     val assistantReply: String = "",
-    val engineUsed: String = "DETERMINISTIC"
+    val engineUsed: String = "DETERMINISTIC",
+    val detectedLanguage: String = "EN",
+    val responseLanguage: String = "EN"
 )
 
 data class ToolResult(
@@ -86,14 +125,18 @@ data class PendingConfirmation(
     val plan: ActionPlan,
     val previewTitle: String,
     val previewBody: String,
-    val stepIndex: Int
+    val stepIndex: Int,
+    val responseLanguage: AppLanguage = AppLanguage.ENGLISH
 )
 
-enum class SpeechLanguageOption(val code: String, val displayName: String) {
-    AUTO("auto", "Auto (EN + TE + HI)"),
-    EN_IN("en-IN", "English (India/US)"),
-    TE_IN("te-IN", "Telugu (తెలుగు)"),
-    HI_IN("hi-IN", "Hindi (हिन्दी)")
+enum class SpeechLanguageOption(val code: String, val displayName: String, val appLanguage: AppLanguage?) {
+    AUTO("auto", "Auto (Multilingual)", null),
+    EN_IN("en-IN", "English (EN)", AppLanguage.ENGLISH),
+    TE_IN("te-IN", "Telugu (తెలుగు)", AppLanguage.TELUGU),
+    HI_IN("hi-IN", "Hindi (हिन्दी)", AppLanguage.HINDI),
+    TA_IN("ta-IN", "Tamil (தமிழ்)", AppLanguage.TAMIL),
+    KN_IN("kn-IN", "Kannada (ಕನ್ನಡ)", AppLanguage.KANNADA),
+    ML_IN("ml-IN", "Malayalam (മലയാളം)", AppLanguage.MALAYALAM)
 }
 
 enum class DeviceTier(val label: String, val recommendation: String) {

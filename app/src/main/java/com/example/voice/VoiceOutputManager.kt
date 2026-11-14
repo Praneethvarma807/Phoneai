@@ -5,12 +5,14 @@ import android.os.Bundle
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.speech.tts.Voice
+import com.example.domain.model.AppLanguage
 import java.util.Locale
 import java.util.UUID
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -77,7 +79,7 @@ class VoiceOutputManager(context: Context) {
         val offline = allVoices
             .filter { !it.isNetworkConnectionRequired }
             .sortedBy { it.locale.displayName }
-        _offlineVoices.value = offline.ifEmpty { allVoices.take(15) }
+        _offlineVoices.value = offline.ifEmpty { allVoices.take(20) }
     }
 
     fun configure(speed: Float, voiceName: String) {
@@ -89,6 +91,19 @@ class VoiceOutputManager(context: Context) {
             if (match != null) {
                 tts?.voice = match
             }
+        }
+    }
+
+    fun setResponseLanguage(language: AppLanguage) {
+        val engine = tts ?: return
+        if (!_isReady.value || currentVoiceName.isNotBlank()) return
+        val locale = Locale.forLanguageTag(language.bcp47)
+        val availability = runCatching { engine.isLanguageAvailable(locale) }
+            .getOrDefault(TextToSpeech.LANG_MISSING_DATA)
+        if (availability >= TextToSpeech.LANG_AVAILABLE) {
+            runCatching { engine.language = locale }
+        } else {
+            runCatching { engine.language = Locale.forLanguageTag("en-IN") }
         }
     }
 
@@ -123,6 +138,14 @@ class VoiceOutputManager(context: Context) {
                         scope.launch { onDone() }
                     }
                 }
+
+                override fun onError(id: String?, errorCode: Int) {
+                    _isSpeaking.value = false
+                    stopSpeechPulse()
+                    if (id == utteranceId) {
+                        scope.launch { onDone() }
+                    }
+                }
             })
         }
         val params = Bundle()
@@ -130,7 +153,7 @@ class VoiceOutputManager(context: Context) {
     }
 
     fun stop() {
-        tts?.stop()
+        runCatching { tts?.stop() }
         _isSpeaking.value = false
         stopSpeechPulse()
     }
@@ -156,8 +179,9 @@ class VoiceOutputManager(context: Context) {
 
     fun shutdown() {
         stopSpeechPulse()
-        tts?.stop()
-        tts?.shutdown()
+        runCatching { tts?.stop() }
+        runCatching { tts?.shutdown() }
         tts = null
+        scope.cancel()
     }
 }

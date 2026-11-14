@@ -62,6 +62,8 @@ class CommanderApplication : Application() {
 
     override fun onTerminate() {
         container.localLlmEngine.shutdown()
+        container.modelDownloadManager.shutdown()
+        container.screenUnderstandingManager.close()
         container.voiceOutputManager.shutdown()
         container.voiceRecognitionManager.shutdown()
         super.onTerminate()
