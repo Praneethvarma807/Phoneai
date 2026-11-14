@@ -1,0 +1,6 @@
+{
+  "name": "AI Commander",
+  "description": "100% API-key-free offline-first AI phone automation assistant with local LiteRT-LM models, deterministic command engine, Hello Buddy wake word detection, browser/app automation, and local screen understanding.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,1044 @@
+package com.example.tools
+
+import android.Manifest
+import android.app.DownloadManager
+import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.media.AudioManager
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
+import android.net.Uri
+import android.provider.AlarmClock
+import android.provider.CalendarContract
+import android.provider.ContactsContract
+import android.provider.MediaStore
+import android.provider.Settings
+import androidx.core.content.ContextCompat
+import com.example.automation.CommanderAccessibilityService
+import com.example.automation.ScreenUnderstandingManager
+import com.example.data.local.LocalNoteDao
+import com.example.data.local.LocalNoteEntity
+import com.example.data.local.LocalReminderDao
+import com.example.data.local.LocalReminderEntity
+import com.example.domain.model.ActionCategory
+import com.example.domain.model.ExecutionStatus
+import com.example.domain.model.ToolResult
+import com.example.domain.model.ToolSchemaInfo
+import java.net.URLEncoder
+
+object PhoneToolsFactory {
+    fun createAll(
+        context: Context,
+        noteDao: LocalNoteDao,
+        reminderDao: LocalReminderDao,
+        screenUnderstandingManager: ScreenUnderstandingManager
+    ): List<CommanderTool> = listOf(
+        OpenAppTool(context),
+        CheckAppInstalledTool(context),
+        OpenUrlTool(context),
+        WebSearchTool(context),
+        BrowserNavigateTool(context),
+        BrowserClickTool(),
+        BrowserTypeTool(),
+        BrowserScrollTool(),
+        GetScreenTextTool(),
+        AnalyzeScreenshotTool(screenUnderstandingManager),
+        AdjustBrightnessTool(context),
+        AdjustVolumeTool(context),
+        OpenSettingsTool(context),
+        CreateReminderTool(reminderDao),
+        CreateCalendarEventTool(context),
+        SearchContactsTool(context),
+        ComposeSmsTool(context),
+        ComposeEmailTool(context),
+        SendWhatsAppDraftTool(context),
+        SearchFilesTool(context),
+        CreateNoteTool(noteDao),
+        SetAlarmTool(context),
+        OpenDownloadsTool(context)
+    )
+}
+
+private fun Context.hasPermission(permission: String): Boolean =
+    ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED
+
+private fun Context.isOnline(): Boolean {
+    val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+    val net = cm.activeNetwork ?: return false
+    val caps = cm.getNetworkCapabilities(net) ?: return false
+    return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+}
+
+private fun findAppPackageByName(context: Context, query: String): Pair<String, String>? {
+    val pm = context.packageManager
+    val launcherIntent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+    val apps = pm.queryIntentActivities(launcherIntent, 0)
+    val q = query.trim().lowercase()
+
+    // Exact or alias matching first
+    val aliases = mapOf(
+        "chrome" to listOf("chrome", "com.android.chrome"),
+        "youtube" to listOf("youtube", "com.google.android.youtube"),
+        "gmail" to listOf("gmail", "com.google.android.gm"),
+        "whatsapp" to listOf("whatsapp", "com.whatsapp"),
+        "play store" to listOf("play store", "com.android.vending"),
+        "settings" to listOf("settings", "com.android.settings"),
+        "camera" to listOf("camera"),
+        "maps" to listOf("maps", "com.google.android.apps.maps"),
+        "calculator" to listOf("calculator"),
+        "clock" to listOf("clock", "deskclock")
+    )
+
+    val candidateTokens = aliases[q] ?: listOf(q)
+    for (token in candidateTokens) {
+        val exact = apps.firstOrNull {
+            val label = it.loadLabel(pm).toString().lowercase()
+            val pkg = it.activityInfo.packageName.lowercase()
+            label == token || pkg == token
+        }
+        if (exact != null) {
+            return exact.activityInfo.packageName to exact.loadLabel(pm).toString()
+        }
+    }
+
+    val partial = apps.firstOrNull {
+        val label = it.loadLabel(pm).toString().lowercase()
+        val pkg = it.activityInfo.packageName.lowercase()
+        label.contains(q) || pkg.contains(q)
+    }
+    return partial?.let { it.activityInfo.packageName to it.loadLabel(pm).toString() }
+}
+
+class OpenAppTool(private val context: Context) : CommanderTool {
+    override val category = ActionCategory.APP_LAUNCH
+    override val schema = ToolSchemaInfo(
+        name = "open_app",
+        description = "Launch an installed Android application by display name or package name.",
+        requiredPermissions = emptyList(),
+        requiresConfirmation = false,
+        parameters = mapOf("app_name" to "string (required)"),
+        category = category.name
+    )
+
+    override fun validate(arguments: Map<String, String>): String? =
+        if (arguments["app_name"].isNullOrBlank()) "Missing 'app_name' parameter." else null
+
+    override suspend fun execute(arguments: Map<String, String>): ToolResult {
+        val appName = arguments.getValue("app_name").trim()
+        val match = findAppPackageByName(context, appName)
+            ?: return ToolResult(
+                toolName = schema.name,
+                status = ExecutionStatus.FAILED,
+                message = "Application '$appName' is not installed or has no launcher activity.",
+                verificationNote = "PackageManager launcher query returned no match",
+                category = category
+            )
+        val (pkg, resolvedLabel) = match
+        val launchIntent = context.packageManager.getLaunchIntentForPackage(pkg)?.apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        } ?: return ToolResult(
+            toolName = schema.name,
+            status = ExecutionStatus.FAILED,
+            message = "Unable to create launch intent for $resolvedLabel ($pkg).",
+            verificationNote = "getLaunchIntentForPackage returned null",
+            category = category
+        )
+        context.startActivity(launchIntent)
+        return ToolResult(
+            toolName = schema.name,
+            status = ExecutionStatus.SUCCESS,
+            message = "Launched $resolvedLabel.",
+            verificationNote = "Verified package $pkg resolved and started",
+            data = mapOf("package" to pkg, "label" to resolvedLabel),
+            category = category
+        )
+    }
+}
+
+class CheckAppInstalledTool(private val context: Context) : CommanderTool {
+    override val category = ActionCategory.APP_LAUNCH
+    override val schema = ToolSchemaInfo(
+        name = "check_app_installed",
+        description = "Check whether a specific app is installed on the device.",
+        requiredPermissions = emptyList(),
+        requiresConfirmation = false,
+        parameters = mapOf("app_name" to "string (required)"),
+        category = category.name
+    )
+
+    override fun validate(arguments: Map<String, String>): String? =
+        if (arguments["app_name"].isNullOrBlank()) "Missing 'app_name' parameter." else null
+
+    override suspend fun execute(arguments: Map<String, String>): ToolResult {
+        val appName = arguments.getValue("app_name").trim()
+        val match = findAppPackageByName(context, appName)
+        return if (match != null) {
+            ToolResult(
+                toolName = schema.name,
+                status = ExecutionStatus.SUCCESS,
+                message = "${match.second} is installed (${match.first}).",
+                verificationNote = "Verified via PackageManager",
+                data = mapOf("installed" to "true", "package" to match.first),
+                category = category
+            )
+        } else {
+            ToolResult(
+                toolName = schema.name,
+                status = ExecutionStatus.SUCCESS,
+                message = "'$appName' was not found among launcher apps.",
+                verificationNote = "Verified not present in launcher query",
+                data = mapOf("installed" to "false"),
+                category = category
+            )
+        }
+    }
+}
+
+class OpenUrlTool(private val context: Context) : CommanderTool {
+    override val category = ActionCategory.BROWSER
+    override val schema = ToolSchemaInfo(
+        name = "open_url",
+        description = "Open an HTTPS/HTTP URL in the device browser.",
+        requiredPermissions = emptyList(),
+        requiresConfirmation = false,
+        parameters = mapOf("url" to "string (required)"),
+        category = category.name
+    )
+
+    override fun validate(arguments: Map<String, String>): String? =
+        if (arguments["url"].isNullOrBlank()) "Missing 'url' parameter." else null
+
+    override suspend fun execute(arguments: Map<String, String>): ToolResult {
+        val raw = arguments.getValue("url").trim()
+        val url = if (raw.startsWith("http://") || raw.startsWith("https://")) raw else "https://$raw"
+        val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        val online = context.isOnline()
+        val canResolve = intent.resolveActivity(context.packageManager) != null
+        if (!canResolve) {
+            return ToolResult(
+                toolName = schema.name,
+                status = ExecutionStatus.FAILED,
+                message = "No browser app available to open $url.",
+                verificationNote = "ACTION_VIEW could not resolve",
+                category = category
+            )
+        }
+        context.startActivity(intent)
+        val offlineNote = if (!online) " Note: Device appears offline; page requires internet." else ""
+        return ToolResult(
+            toolName = schema.name,
+            status = ExecutionStatus.SUCCESS,
+            message = "Opened $url in browser.$offlineNote",
+            verificationNote = "Verified browser activity started",
+            data = mapOf("url" to url, "online" to online.toString()),
+            category = category
+        )
+    }
+}
+
+class WebSearchTool(private val context: Context) : CommanderTool {
+    override val category = ActionCategory.SEARCH
+    override val schema = ToolSchemaInfo(
+        name = "web_search",
+        description = "Perform a public web search in the user's browser.",
+        requiredPermissions = emptyList(),
+        requiresConfirmation = false,
+        parameters = mapOf("query" to "string (required)"),
+        category = category.name
+    )
+
+    override fun validate(arguments: Map<String, String>): String? =
+        if (arguments["query"].isNullOrBlank()) "Missing 'query' parameter." else null
+
+    override suspend fun execute(arguments: Map<String, String>): ToolResult {
+        val query = arguments.getValue("query").trim()
+        val encoded = URLEncoder.encode(query, "UTF-8")
+        val url = "https://www.google.com/search?q=$encoded"
+        val online = context.isOnline()
+        if (!online) {
+            return ToolResult(
+                toolName = schema.name,
+                status = ExecutionStatus.FAILED,
+                message = "Live web search requires internet connectivity. Device is currently offline.",
+                verificationNote = "ConnectivityManager reports offline state",
+                category = category
+            )
+        }
+        val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        context.startActivity(intent)
+        return ToolResult(
+            toolName = schema.name,
+            status = ExecutionStatus.SUCCESS,
+            message = "Searching Google for \"$query\".",
+            verificationNote = "Verified browser search intent launched",
+            data = mapOf("url" to url),
+            category = category
+        )
+    }
+}
+
+class BrowserNavigateTool(private val context: Context) : CommanderTool {
+    override val category = ActionCategory.BROWSER
+    override val schema = ToolSchemaInfo(
+        name = "browser_navigate",
+        description = "Navigate to a URL or go back in the browser.",
+        requiredPermissions = listOf("AccessibilityService (for back navigation)"),
+        requiresConfirmation = false,
+        parameters = mapOf("action" to "back | url", "url" to "optional URL"),
+        category = category.name
+    )
+
+    override suspend fun execute(arguments: Map<String, String>): ToolResult {
+        val action = arguments["action"]?.lowercase() ?: "url"
+        if (action == "back") {
+            val service = CommanderAccessibilityService.activeService.value
+                ?: return ToolResult(
+                    toolName = schema.name,
+                    status = ExecutionStatus.PERMISSION_REQUIRED,
+                    message = "Enable AI Phone Commander Accessibility Service to navigate backward.",
+                    verificationNote = "AccessibilityService inactive",
+                    requiresAccessibility = true,
+                    category = category
+                )
+            val ok = service.navigateBack()
+            return ToolResult(
+                toolName = schema.name,
+                status = if (ok) ExecutionStatus.SUCCESS else ExecutionStatus.FAILED,
+                message = if (ok) "Navigated back." else "Back navigation failed.",
+                verificationNote = "Accessibility GLOBAL_ACTION_BACK=$ok",
+                category = category
+            )
+        }
+        val url = arguments["url"].orEmpty()
+        return OpenUrlTool(context).execute(mapOf("url" to url))
+    }
+}
+
+class BrowserClickTool : CommanderTool {
+    override val category = ActionCategory.BROWSER
+    override val schema = ToolSchemaInfo(
+        name = "browser_click",
+        description = "Click a visible button, link, or UI element matching target text via Accessibility Service.",
+        requiredPermissions = listOf("AccessibilityService"),
+        requiresConfirmation = false,
+        parameters = mapOf("target" to "string (required)"),
+        category = category.name
+    )
+
+    override fun validate(arguments: Map<String, String>): String? =
+        if (arguments["target"].isNullOrBlank()) "Missing 'target' text to click." else null
+
+    override suspend fun execute(arguments: Map<String, String>): ToolResult {
+        val service = CommanderAccessibilityService.activeService.value
+            ?: return ToolResult(
+                toolName = schema.name,
+                status = ExecutionStatus.PERMISSION_REQUIRED,
+                message = "Accessibility Service is required to click UI elements.",
+                verificationNote = "AccessibilityService disconnected",
+                requiresAccessibility = true,
+                category = category
+            )
+        val target = arguments.getValue("target")
+        val clicked = service.clickNodeByText(target)
+        return ToolResult(
+            toolName = schema.name,
+            status = if (clicked) ExecutionStatus.SUCCESS else ExecutionStatus.FAILED,
+            message = if (clicked) "Clicked element matching \"$target\"." else "Could not find clickable element matching \"$target\".",
+            verificationNote = "ACTION_CLICK result=$clicked",
+            category = category
+        )
+    }
+}
+
+class BrowserTypeTool : CommanderTool {
+    override val category = ActionCategory.BROWSER
+    override val schema = ToolSchemaInfo(
+        name = "browser_type",
+        description = "Enter text into an editable field via Accessibility Service.",
+        requiredPermissions = listOf("AccessibilityService"),
+        requiresConfirmation = false,
+        parameters = mapOf("text" to "string (required)", "target" to "optional field hint"),
+        category = category.name
+    )
+
+    override fun validate(arguments: Map<String, String>): String? =
+        if (arguments["text"].isNullOrBlank()) "Missing 'text' to enter." else null
+
+    override suspend fun execute(arguments: Map<String, String>): ToolResult {
+        val service = CommanderAccessibilityService.activeService.value
+            ?: return ToolResult(
+                toolName = schema.name,
+                status = ExecutionStatus.PERMISSION_REQUIRED,
+                message = "Accessibility Service is required to enter text in external apps/browsers.",
+                verificationNote = "AccessibilityService disconnected",
+                requiresAccessibility = true,
+                category = category
+            )
+        val text = arguments.getValue("text")
+        val target = arguments["target"]
+        val ok = service.typeTextInField(target, text)
+        return ToolResult(
+            toolName = schema.name,
+            status = if (ok) ExecutionStatus.SUCCESS else ExecutionStatus.FAILED,
+            message = if (ok) "Entered text into field." else "No editable field found on current screen.",
+            verificationNote = "ACTION_SET_TEXT result=$ok",
+            category = category
+        )
+    }
+}
+
+class BrowserScrollTool : CommanderTool {
+    override val category = ActionCategory.BROWSER
+    override val schema = ToolSchemaInfo(
+        name = "browser_scroll",
+        description = "Scroll the active browser or app window up or down.",
+        requiredPermissions = listOf("AccessibilityService"),
+        requiresConfirmation = false,
+        parameters = mapOf("direction" to "down | up"),
+        category = category.name
+    )
+
+    override suspend fun execute(arguments: Map<String, String>): ToolResult {
+        val service = CommanderAccessibilityService.activeService.value
+            ?: return ToolResult(
+                toolName = schema.name,
+                status = ExecutionStatus.PERMISSION_REQUIRED,
+                message = "Accessibility Service is required to scroll active windows.",
+                verificationNote = "AccessibilityService disconnected",
+                requiresAccessibility = true,
+                category = category
+            )
+        val direction = arguments["direction"] ?: "down"
+        val scrolled = service.scrollWindow(direction)
+        return ToolResult(
+            toolName = schema.name,
+            status = if (scrolled) ExecutionStatus.SUCCESS else ExecutionStatus.FAILED,
+            message = if (scrolled) "Scrolled $direction." else "Active window has no scrollable container.",
+            verificationNote = "Scroll $direction=$scrolled",
+            category = category
+        )
+    }
+}
+
+class GetScreenTextTool : CommanderTool {
+    override val category = ActionCategory.VISION
+    override val schema = ToolSchemaInfo(
+        name = "get_screen_text",
+        description = "Read visible text and interactive elements on the current screen via Accessibility Service.",
+        requiredPermissions = listOf("AccessibilityService"),
+        requiresConfirmation = false,
+        parameters = emptyMap(),
+        category = category.name
+    )
+
+    override suspend fun execute(arguments: Map<String, String>): ToolResult {
+        val service = CommanderAccessibilityService.activeService.value
+            ?: return ToolResult(
+                toolName = schema.name,
+                status = ExecutionStatus.PERMISSION_REQUIRED,
+                message = "Accessibility Service is off. Enable it in Permissions to read screen elements.",
+                verificationNote = "AccessibilityService disconnected",
+                requiresAccessibility = true,
+                category = category
+            )
+        val snapshot = service.captureScreenSnapshot()
+            ?: return ToolResult(
+                toolName = schema.name,
+                status = ExecutionStatus.FAILED,
+                message = "Active window returned no readable nodes.",
+                verificationNote = "rootInActiveWindow was null",
+                category = category
+            )
+        return ToolResult(
+            toolName = schema.name,
+            status = ExecutionStatus.SUCCESS,
+            message = "Read ${snapshot.visibleLines.size} visible text items from ${snapshot.packageName}.",
+            verificationNote = "Extracted ${snapshot.visibleLines.size} lines locally",
+            data = mapOf(
+                "package" to snapshot.packageName,
+                "text" to snapshot.combinedText.take(1500),
+                "clickables" to snapshot.clickableTargets.take(10).joinToString(", ")
+            ),
+            category = category
+        )
+    }
+}
+
+class AnalyzeScreenshotTool(
+    private val screenUnderstandingManager: ScreenUnderstandingManager
+) : CommanderTool {
+    override val category = ActionCategory.VISION
+    override val schema = ToolSchemaInfo(
+        name = "analyze_screenshot",
+        description = "Capture screen locally via MediaProjection + ML Kit OCR and explain visible content without cloud upload.",
+        requiredPermissions = listOf("MediaProjection OR AccessibilityService"),
+        requiresConfirmation = false,
+        parameters = mapOf("mode" to "explain | ocr"),
+        category = category.name
+    )
+
+    override suspend fun execute(arguments: Map<String, String>): ToolResult {
+        val hasAccessibility = CommanderAccessibilityService.isConnected()
+        if (!screenUnderstandingManager.hasProjectionGrant() && !hasAccessibility) {
+            return ToolResult(
+                toolName = schema.name,
+                status = ExecutionStatus.PERMISSION_REQUIRED,
+                message = "Grant Screen Capture permission (or enable Accessibility) to analyze your screen locally.",
+                verificationNote = "Awaiting MediaProjection consent",
+                requiresScreenCapture = true,
+                category = category
+            )
+        }
+        val reportResult = screenUnderstandingManager.analyzeCurrentScreen()
+        return reportResult.fold(
+            onSuccess = { report ->
+                ToolResult(
+                    toolName = schema.name,
+                    status = ExecutionStatus.SUCCESS,
+                    message = report.explanation,
+                    verificationNote = "Analyzed locally via ${report.sourceUsed}",
+                    data = mapOf(
+                        "source" to report.sourceUsed,
+                        "extracted_text" to report.extractedText,
+                        "suggestions" to report.suggestedActions.joinToString(" | ")
+                    ),
+                    category = category
+                )
+            },
+            onFailure = { err ->
+                ToolResult(
+                    toolName = schema.name,
+                    status = ExecutionStatus.FAILED,
+                    message = err.message ?: "Screen analysis failed.",
+                    verificationNote = "Local OCR / capture returned empty",
+                    category = category
+                )
+            }
+        )
+    }
+}
+
+class AdjustBrightnessTool(private val context: Context) : CommanderTool {
+    override val category = ActionCategory.SETTINGS
+    override val schema = ToolSchemaInfo(
+        name = "adjust_brightness",
+        description = "Adjust system screen brightness (0-100%) when WRITE_SETTINGS is granted.",
+        requiredPermissions = listOf("android.permission.WRITE_SETTINGS"),
+        requiresConfirmation = false,
+        parameters = mapOf("level" to "integer 5..100"),
+        category = category.name
+    )
+
+    override suspend fun execute(arguments: Map<String, String>): ToolResult {
+        if (!Settings.System.canWrite(context)) {
+            return ToolResult(
+                toolName = schema.name,
+                status = ExecutionStatus.PERMISSION_REQUIRED,
+                message = "Modify System Settings (WRITE_SETTINGS) permission is required to adjust brightness.",
+                verificationNote = "Settings.System.canWrite returned false",
+                requiresWriteSettings = true,
+                category = category
+            )
+        }
+        val pct = (arguments["level"]?.toIntOrNull() ?: 60).coerceIn(5, 100)
+        val value = (pct * 255) / 100
+        Settings.System.putInt(context.contentResolver, Settings.System.SCREEN_BRIGHTNESS_MODE, Settings.System.SCREEN_BRIGHTNESS_MODE_MANUAL)
+        Settings.System.putInt(context.contentResolver, Settings.System.SCREEN_BRIGHTNESS, value)
+        val readback = Settings.System.getInt(context.contentResolver, Settings.System.SCREEN_BRIGHTNESS, -1)
+        return ToolResult(
+            toolName = schema.name,
+            status = ExecutionStatus.SUCCESS,
+            message = "Screen brightness set to $pct%.",
+            verificationNote = "Readback SCREEN_BRIGHTNESS=$readback/255",
+            data = mapOf("brightness_pct" to pct.toString(), "raw" to readback.toString()),
+            category = category
+        )
+    }
+}
+
+class AdjustVolumeTool(private val context: Context) : CommanderTool {
+    override val category = ActionCategory.SETTINGS
+    override val schema = ToolSchemaInfo(
+        name = "adjust_volume",
+        description = "Adjust media audio volume (up, down, mute).",
+        requiredPermissions = emptyList(),
+        requiresConfirmation = false,
+        parameters = mapOf("direction" to "up | down | mute"),
+        category = category.name
+    )
+
+    override suspend fun execute(arguments: Map<String, String>): ToolResult {
+        val am = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        val direction = arguments["direction"]?.lowercase() ?: "up"
+        when (direction) {
+            "mute" -> am.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_MUTE, AudioManager.FLAG_SHOW_UI)
+            "down" -> am.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_LOWER, AudioManager.FLAG_SHOW_UI)
+            else -> am.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_RAISE, AudioManager.FLAG_SHOW_UI)
+        }
+        val current = am.getStreamVolume(AudioManager.STREAM_MUSIC)
+        val max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+        return ToolResult(
+            toolName = schema.name,
+            status = ExecutionStatus.SUCCESS,
+            message = "Media volume adjusted ($direction): $current/$max.",
+            verificationNote = "Verified AudioManager stream level $current/$max",
+            data = mapOf("current" to current.toString(), "max" to max.toString()),
+            category = category
+        )
+    }
+}
+
+class OpenSettingsTool(private val context: Context) : CommanderTool {
+    override val category = ActionCategory.SETTINGS
+    override val schema = ToolSchemaInfo(
+        name = "open_settings",
+        description = "Open specific Android system settings screens.",
+        requiredPermissions = emptyList(),
+        requiresConfirmation = false,
+        parameters = mapOf("section" to "wifi | bluetooth | display | sound | location | battery | accessibility | apps | main"),
+        category = category.name
+    )
+
+    override suspend fun execute(arguments: Map<String, String>): ToolResult {
+        val section = arguments["section"]?.lowercase() ?: "main"
+        val action = when (section) {
+            "wifi" -> Settings.ACTION_WIFI_SETTINGS
+            "bluetooth" -> Settings.ACTION_BLUETOOTH_SETTINGS
+            "display" -> Settings.ACTION_DISPLAY_SETTINGS
+            "sound" -> Settings.ACTION_SOUND_SETTINGS
+            "location" -> Settings.ACTION_LOCATION_SOURCE_SETTINGS
+            "battery" -> Settings.ACTION_BATTERY_SAVER_SETTINGS
+            "accessibility" -> Settings.ACTION_ACCESSIBILITY_SETTINGS
+            "apps" -> Settings.ACTION_APPLICATION_SETTINGS
+            else -> Settings.ACTION_SETTINGS
+        }
+        val intent = Intent(action).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        val fallback = Intent(Settings.ACTION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        val resolved = if (intent.resolveActivity(context.packageManager) != null) intent else fallback
+        context.startActivity(resolved)
+        return ToolResult(
+            toolName = schema.name,
+            status = ExecutionStatus.SUCCESS,
+            message = "Opened $section settings.",
+            verificationNote = "Settings activity started (${resolved.action})",
+            category = category
+        )
+    }
+}
+
+class CreateReminderTool(private val reminderDao: LocalReminderDao) : CommanderTool {
+    override val category = ActionCategory.CALENDAR
+    override val schema = ToolSchemaInfo(
+        name = "create_reminder",
+        description = "Create and save a local reminder in the on-device database.",
+        requiredPermissions = emptyList(),
+        requiresConfirmation = false,
+        parameters = mapOf("title" to "string (required)", "delay_minutes" to "optional integer"),
+        category = category.name
+    )
+
+    override fun validate(arguments: Map<String, String>): String? =
+        if (arguments["title"].isNullOrBlank()) "Missing reminder 'title'." else null
+
+    override suspend fun execute(arguments: Map<String, String>): ToolResult {
+        val title = arguments.getValue("title").trim()
+        val delayMin = arguments["delay_minutes"]?.toLongOrNull() ?: 60L
+        val triggerAt = System.currentTimeMillis() + delayMin * 60_000L
+        val id = reminderDao.insert(LocalReminderEntity(title = title, triggerAtMillis = triggerAt))
+        return ToolResult(
+            toolName = schema.name,
+            status = ExecutionStatus.SUCCESS,
+            message = "Saved reminder #$id: \"$title\".",
+            verificationNote = "Persisted in Room local_reminders table (id=$id)",
+            data = mapOf("reminder_id" to id.toString(), "title" to title),
+            category = category
+        )
+    }
+}
+
+class CreateCalendarEventTool(private val context: Context) : CommanderTool {
+    override val category = ActionCategory.CALENDAR
+    override val schema = ToolSchemaInfo(
+        name = "create_calendar_event",
+        description = "Create a calendar event using Android Calendar Intent.",
+        requiredPermissions = emptyList(),
+        requiresConfirmation = false,
+        parameters = mapOf("title" to "string (required)", "location" to "optional string"),
+        category = category.name
+    )
+
+    override fun validate(arguments: Map<String, String>): String? =
+        if (arguments["title"].isNullOrBlank()) "Missing event 'title'." else null
+
+    override suspend fun execute(arguments: Map<String, String>): ToolResult {
+        val title = arguments.getValue("title").trim()
+        val location = arguments["location"].orEmpty()
+        val start = System.currentTimeMillis() + 3600_000L
+        val intent = Intent(Intent.ACTION_INSERT).apply {
+            data = CalendarContract.Events.CONTENT_URI
+            putExtra(CalendarContract.Events.TITLE, title)
+            if (location.isNotBlank()) putExtra(CalendarContract.Events.EVENT_LOCATION, location)
+            putExtra(CalendarContract.EXTRA_EVENT_BEGIN_TIME, start)
+            putExtra(CalendarContract.EXTRA_EVENT_END_TIME, start + 3600_000L)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        if (intent.resolveActivity(context.packageManager) == null) {
+            return ToolResult(
+                toolName = schema.name,
+                status = ExecutionStatus.FAILED,
+                message = "No Calendar app available to create event.",
+                verificationNote = "Calendar Intent unresolved",
+                category = category
+            )
+        }
+        context.startActivity(intent)
+        return ToolResult(
+            toolName = schema.name,
+            status = ExecutionStatus.SUCCESS,
+            message = "Opened Calendar editor for \"$title\".",
+            verificationNote = "CalendarContract.Events insert intent launched",
+            category = category
+        )
+    }
+}
+
+class SearchContactsTool(private val context: Context) : CommanderTool {
+    override val category = ActionCategory.MESSAGING
+    override val schema = ToolSchemaInfo(
+        name = "search_contacts",
+        description = "Search local device contacts by name.",
+        requiredPermissions = listOf(Manifest.permission.READ_CONTACTS),
+        requiresConfirmation = false,
+        parameters = mapOf("query" to "string"),
+        category = category.name
+    )
+
+    override suspend fun execute(arguments: Map<String, String>): ToolResult {
+        if (!context.hasPermission(Manifest.permission.READ_CONTACTS)) {
+            return ToolResult(
+                toolName = schema.name,
+                status = ExecutionStatus.PERMISSION_REQUIRED,
+                message = "Contacts permission is required to look up contacts.",
+                verificationNote = "READ_CONTACTS not granted",
+                missingPermissions = listOf(Manifest.permission.READ_CONTACTS),
+                category = category
+            )
+        }
+        val query = arguments["query"].orEmpty().trim()
+        val matches = mutableListOf<String>()
+        val projection = arrayOf(
+            ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
+            ContactsContract.CommonDataKinds.Phone.NUMBER
+        )
+        val selection = if (query.isNotBlank()) "${ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME} LIKE ?" else null
+        val selArgs = if (query.isNotBlank()) arrayOf("%$query%") else null
+
+        context.contentResolver.query(
+            ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+            projection,
+            selection,
+            selArgs,
+            "${ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME} ASC"
+        )?.use { cursor ->
+            while (cursor.moveToNext() && matches.size < 8) {
+                val name = cursor.getString(0) ?: "Unknown"
+                val number = cursor.getString(1) ?: ""
+                matches.add("$name ($number)")
+            }
+        }
+        return ToolResult(
+            toolName = schema.name,
+            status = ExecutionStatus.SUCCESS,
+            message = if (matches.isEmpty()) "No contacts matched '$query'." else "Found ${matches.size} contact(s): ${matches.joinToString("; ")}",
+            verificationNote = "Queried ContactsContract locally",
+            data = mapOf("matches" to matches.joinToString("\n")),
+            category = category
+        )
+    }
+}
+
+class ComposeSmsTool(private val context: Context) : CommanderTool {
+    override val category = ActionCategory.MESSAGING
+    override val schema = ToolSchemaInfo(
+        name = "compose_sms",
+        description = "Draft an SMS message (opens system SMS composer; never sends automatically).",
+        requiredPermissions = emptyList(),
+        requiresConfirmation = true,
+        parameters = mapOf("recipient" to "phone or name", "body" to "message text"),
+        category = category.name
+    )
+
+    override suspend fun execute(arguments: Map<String, String>): ToolResult {
+        val recipient = arguments["recipient"].orEmpty().trim()
+        val body = arguments["body"].orEmpty().trim()
+        val uri = Uri.parse("smsto:${Uri.encode(recipient)}")
+        val intent = Intent(Intent.ACTION_SENDTO, uri).apply {
+            putExtra("sms_body", body)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        if (intent.resolveActivity(context.packageManager) == null) {
+            return ToolResult(
+                toolName = schema.name,
+                status = ExecutionStatus.FAILED,
+                message = "No SMS app found on device.",
+                verificationNote = "smsto intent unresolved",
+                category = category
+            )
+        }
+        context.startActivity(intent)
+        return ToolResult(
+            toolName = schema.name,
+            status = ExecutionStatus.SUCCESS,
+            message = "Opened SMS draft for ${recipient.ifBlank { "selected contact" }}.",
+            verificationNote = "Draft opened in SMS app (user sends manually)",
+            category = category
+        )
+    }
+}
+
+class ComposeEmailTool(private val context: Context) : CommanderTool {
+    override val category = ActionCategory.MESSAGING
+    override val schema = ToolSchemaInfo(
+        name = "compose_email",
+        description = "Draft an email in the user's mail client (requires confirmation).",
+        requiredPermissions = emptyList(),
+        requiresConfirmation = true,
+        parameters = mapOf("to" to "email address", "subject" to "subject line", "body" to "email body"),
+        category = category.name
+    )
+
+    override suspend fun execute(arguments: Map<String, String>): ToolResult {
+        val to = arguments["to"].orEmpty().trim()
+        val subject = arguments["subject"].orEmpty().trim()
+        val body = arguments["body"].orEmpty().trim()
+        val intent = Intent(Intent.ACTION_SENDTO).apply {
+            data = Uri.parse("mailto:")
+            if (to.isNotBlank()) putExtra(Intent.EXTRA_EMAIL, arrayOf(to))
+            putExtra(Intent.EXTRA_SUBJECT, subject)
+            putExtra(Intent.EXTRA_TEXT, body)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        if (intent.resolveActivity(context.packageManager) == null) {
+            return ToolResult(
+                toolName = schema.name,
+                status = ExecutionStatus.FAILED,
+                message = "No email app found on device.",
+                verificationNote = "mailto intent unresolved",
+                category = category
+            )
+        }
+        context.startActivity(intent)
+        return ToolResult(
+            toolName = schema.name,
+            status = ExecutionStatus.SUCCESS,
+            message = "Opened email draft${if (to.isNotBlank()) " to $to" else ""}.",
+            verificationNote = "Email composer launched",
+            category = category
+        )
+    }
+}
+
+class SendWhatsAppDraftTool(private val context: Context) : CommanderTool {
+    override val category = ActionCategory.MESSAGING
+    override val schema = ToolSchemaInfo(
+        name = "send_whatsapp_draft",
+        description = "Prepare a WhatsApp message draft (opens WhatsApp composer; requires confirmation).",
+        requiredPermissions = emptyList(),
+        requiresConfirmation = true,
+        parameters = mapOf("recipient" to "optional name/number", "message" to "message text"),
+        category = category.name
+    )
+
+    override suspend fun execute(arguments: Map<String, String>): ToolResult {
+        val msg = arguments["message"].orEmpty().trim()
+        val intent = Intent(Intent.ACTION_SEND).apply {
+            type = "text/plain"
+            setPackage("com.whatsapp")
+            putExtra(Intent.EXTRA_TEXT, msg)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        if (intent.resolveActivity(context.packageManager) != null) {
+            context.startActivity(intent)
+            return ToolResult(
+                toolName = schema.name,
+                status = ExecutionStatus.SUCCESS,
+                message = "Opened WhatsApp with prepared message draft.",
+                verificationNote = "WhatsApp ACTION_SEND launched",
+                category = category
+            )
+        }
+        return ToolResult(
+            toolName = schema.name,
+            status = ExecutionStatus.FAILED,
+            message = "WhatsApp is not installed on this device.",
+            verificationNote = "com.whatsapp not found",
+            category = category
+        )
+    }
+}
+
+class SearchFilesTool(private val context: Context) : CommanderTool {
+    override val category = ActionCategory.DOCUMENT
+    override val schema = ToolSchemaInfo(
+        name = "search_files",
+        description = "Search local documents and app-created files without broad storage permissions.",
+        requiredPermissions = emptyList(),
+        requiresConfirmation = false,
+        parameters = mapOf("query" to "optional filename keyword"),
+        category = category.name
+    )
+
+    override suspend fun execute(arguments: Map<String, String>): ToolResult {
+        val query = arguments["query"].orEmpty().trim().lowercase()
+        val found = mutableListOf<String>()
+
+        // 1. Check app-local exported/created files
+        context.filesDir.listFiles()?.forEach { file ->
+            if (file.isFile && (query.isBlank() || file.name.lowercase().contains(query))) {
+                found.add("${file.name} (${file.length() / 1024} KB, internal)")
+            }
+        }
+
+        // 2. Query MediaStore Downloads (accessible without broad READ_EXTERNAL_STORAGE on API 29+)
+        runCatching {
+            val projection = arrayOf(MediaStore.MediaColumns.DISPLAY_NAME, MediaStore.MediaColumns.SIZE)
+            context.contentResolver.query(
+                MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+                projection,
+                null,
+                null,
+                "${MediaStore.MediaColumns.DATE_MODIFIED} DESC"
+            )?.use { cursor ->
+                while (cursor.moveToNext() && found.size < 12) {
+                    val name = cursor.getString(0) ?: continue
+                    val size = cursor.getLong(1)
+                    if (query.isBlank() || name.lowercase().contains(query)) {
+                        found.add("$name (${size / 1024} KB)")
+                    }
+                }
+            }
+        }
+
+        return ToolResult(
+            toolName = schema.name,
+            status = ExecutionStatus.SUCCESS,
+            message = if (found.isEmpty()) {
+                "No accessible documents matched '$query'. Use the Document Picker in Tools to open any PDF/file."
+            } else {
+                "Found ${found.size} document(s): ${found.joinToString(", ")}"
+            },
+            verificationNote = "Queried internal files & MediaStore Downloads",
+            data = mapOf("files" to found.joinToString("\n")),
+            category = category
+        )
+    }
+}
+
+class CreateNoteTool(private val noteDao: LocalNoteDao) : CommanderTool {
+    override val category = ActionCategory.DOCUMENT
+    override val schema = ToolSchemaInfo(
+        name = "create_note",
+        description = "Create and save a private on-device note in Room database.",
+        requiredPermissions = emptyList(),
+        requiresConfirmation = false,
+        parameters = mapOf("title" to "string", "content" to "string (required)"),
+        category = category.name
+    )
+
+    override fun validate(arguments: Map<String, String>): String? =
+        if (arguments["content"].isNullOrBlank() && arguments["title"].isNullOrBlank()) "Note content cannot be empty." else null
+
+    override suspend fun execute(arguments: Map<String, String>): ToolResult {
+        val content = arguments["content"].orEmpty().ifBlank { arguments["title"].orEmpty() }.trim()
+        val title = arguments["title"].orEmpty().ifBlank { content.take(40) }.trim()
+        val id = noteDao.insert(LocalNoteEntity(title = title, content = content))
+        return ToolResult(
+            toolName = schema.name,
+            status = ExecutionStatus.SUCCESS,
+            message = "Saved note \"$title\" locally.",
+            verificationNote = "Persisted in Room local_notes table (id=$id)",
+            data = mapOf("note_id" to id.toString(), "title" to title),
+            category = category
+        )
+    }
+}
+
+class SetAlarmTool(private val context: Context) : CommanderTool {
+    override val category = ActionCategory.CALENDAR
+    override val schema = ToolSchemaInfo(
+        name = "set_alarm",
+        description = "Set an alarm using the system AlarmClock API.",
+        requiredPermissions = listOf("com.android.alarm.permission.SET_ALARM"),
+        requiresConfirmation = false,
+        parameters = mapOf("hour" to "0..23", "minute" to "0..59", "label" to "optional label"),
+        category = category.name
+    )
+
+    override suspend fun execute(arguments: Map<String, String>): ToolResult {
+        val hour = (arguments["hour"]?.toIntOrNull() ?: 7).coerceIn(0, 23)
+        val minute = (arguments["minute"]?.toIntOrNull() ?: 0).coerceIn(0, 59)
+        val label = arguments["label"] ?: "AI Commander Alarm"
+        val intent = Intent(AlarmClock.ACTION_SET_ALARM).apply {
+            putExtra(AlarmClock.EXTRA_HOUR, hour)
+            putExtra(AlarmClock.EXTRA_MINUTES, minute)
+            putExtra(AlarmClock.EXTRA_MESSAGE, label)
+            putExtra(AlarmClock.EXTRA_SKIP_UI, false)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        if (intent.resolveActivity(context.packageManager) == null) {
+            return ToolResult(
+                toolName = schema.name,
+                status = ExecutionStatus.FAILED,
+                message = "No Clock app found to set alarm.",
+                verificationNote = "ACTION_SET_ALARM unresolved",
+                category = category
+            )
+        }
+        context.startActivity(intent)
+        return ToolResult(
+            toolName = schema.name,
+            status = ExecutionStatus.SUCCESS,
+            message = "Alarm set for %02d:%02d (%s).".format(hour, minute, label),
+            verificationNote = "AlarmClock intent launched",
+            category = category
+        )
+    }
+}
+
+class OpenDownloadsTool(private val context: Context) : CommanderTool {
+    override val category = ActionCategory.DOCUMENT
+    override val schema = ToolSchemaInfo(
+        name = "open_downloads",
+        description = "Open the system Downloads viewer.",
+        requiredPermissions = emptyList(),
+        requiresConfirmation = false,
+        parameters = emptyMap(),
+        category = category.name
+    )
+
+    override suspend fun execute(arguments: Map<String, String>): ToolResult {
+        val intent = Intent(DownloadManager.ACTION_VIEW_DOWNLOADS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        if (intent.resolveActivity(context.packageManager) == null) {
+            return ToolResult(
+                toolName = schema.name,
+                status = ExecutionStatus.FAILED,
+                message = "No Downloads viewer available.",
+                verificationNote = "ACTION_VIEW_DOWNLOADS unresolved",
+                category = category
+            )
+        }
+        context.startActivity(intent)
+        return ToolResult(
+            toolName = schema.name,
+            status = ExecutionStatus.SUCCESS,
+            message = "Opened Downloads.",
+            verificationNote = "DownloadManager viewer launched",
+            category = category
+        )
+    }
+}

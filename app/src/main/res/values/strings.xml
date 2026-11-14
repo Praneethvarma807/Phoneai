@@ -1,0 +1,9 @@
+<resources>
+    <string name="app_name">AI Commander</string>
+    <string name="app_full_title">AI Phone Commander</string>
+    <string name="accessibility_service_description">Allows AI Phone Commander to read visible screen text and perform user-authorized browser or app interactions (scrolling, clicking, and form entry) when you issue a command.</string>
+    <string name="wake_word_channel_name">Hello Buddy Wake Word</string>
+    <string name="wake_word_channel_description">Active when offline wake word listening is enabled by the user.</string>
+    <string name="screen_capture_channel_name">Local Screen Understanding</string>
+    <string name="screen_capture_channel_description">Active briefly while capturing your screen locally for on-device OCR and explanation.</string>
+</resources>
