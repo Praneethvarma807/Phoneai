@@ -50,9 +50,9 @@ jobs:
       - name: Run unit tests and build Debug APK
         run: |
           if [ -x ./gradlew ]; then
-            ./gradlew testDebugUnitTest assembleDebug --stacktrace
+            ./gradlew clean testDebugUnitTest assembleDebug --stacktrace
           else
-            gradle testDebugUnitTest assembleDebug --stacktrace
+            gradle clean testDebugUnitTest assembleDebug --stacktrace
           fi
 
       - name: Verify Debug APK exists
