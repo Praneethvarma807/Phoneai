@@ -129,9 +129,25 @@ data class PendingConfirmation(
     val responseLanguage: AppLanguage = AppLanguage.ENGLISH
 )
 
+enum class RecognizerBackendMode(val label: String) {
+    ON_DEVICE("On-Device"),
+    SYSTEM_DEFAULT("Platform Service"),
+    CUSTOM_SERVICE("Alt Recognition Service"),
+    UNAVAILABLE("Unavailable")
+}
+
+enum class LanguageSupportStatus(val label: String) {
+    VERIFIED_OFFLINE("Offline Ready"),
+    VERIFIED_ONLINE_ONLY("Network Only"),
+    UNSUPPORTED("Unsupported"),
+    UNVERIFIED_ERROR_14("Unverified"),
+    UNKNOWN("Checking…")
+}
+
 enum class SpeechLanguageOption(val code: String, val displayName: String, val appLanguage: AppLanguage?) {
     AUTO("auto", "Auto (Multilingual)", null),
-    EN_IN("en-IN", "English (EN)", AppLanguage.ENGLISH),
+    EN_IN("en-IN", "English (IN)", AppLanguage.ENGLISH),
+    EN_US("en-US", "English (US)", AppLanguage.ENGLISH),
     TE_IN("te-IN", "Telugu (తెలుగు)", AppLanguage.TELUGU),
     HI_IN("hi-IN", "Hindi (हिन्दी)", AppLanguage.HINDI),
     TA_IN("ta-IN", "Tamil (தமிழ்)", AppLanguage.TAMIL),

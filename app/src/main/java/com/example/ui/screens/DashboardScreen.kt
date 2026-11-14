@@ -124,7 +124,7 @@ fun DashboardScreen(
 
     LaunchedEffect(execState.currentCommand, execState.finalStatus) {
         if (execState.pipelineStage != PipelineStage.IDLE || execState.finalReply.isNotBlank()) {
-            listState.animateScrollToItem(2)
+            listState.animateScrollToItem(3)
         }
     }
 
@@ -340,25 +340,46 @@ fun DashboardScreen(
                             onClick = triggerVoiceInput
                         )
                         Spacer(Modifier.height(6.dp))
+                        val orbLabel = when {
+                            voiceState.isStarting -> "Connecting speech service (${voiceState.backendMode.label})…"
+                            effectiveOrbState == OrbState.LISTENING -> "Listening… ${voiceState.durationMs / 1000}s"
+                            effectiveOrbState == OrbState.WAKE_WORD_WAITING -> "Listening locally for \"Hello Buddy\""
+                            effectiveOrbState == OrbState.WAKE_WORD_DETECTED -> "Hello Buddy detected!"
+                            effectiveOrbState == OrbState.THINKING -> "Local AI planning action…"
+                            effectiveOrbState == OrbState.PROCESSING -> "Understanding command…"
+                            effectiveOrbState == OrbState.EXECUTING -> "Executing ${execState.activeToolName}…"
+                            effectiveOrbState == OrbState.SPEAKING -> "Speaking response…"
+                            effectiveOrbState == OrbState.SUCCESS -> "Verified & Completed"
+                            effectiveOrbState == OrbState.ERROR -> "Voice / Execution Attention Needed"
+                            else -> "Tap Orb to Speak"
+                        }
                         Text(
-                            text = when (effectiveOrbState) {
-                                OrbState.LISTENING -> "Listening… ${voiceState.durationMs / 1000}s"
-                                OrbState.WAKE_WORD_WAITING -> "Listening locally for \"Hello Buddy\""
-                                OrbState.WAKE_WORD_DETECTED -> "Hello Buddy detected!"
-                                OrbState.THINKING -> "Local AI planning action…"
-                                OrbState.PROCESSING -> "Understanding command…"
-                                OrbState.EXECUTING -> "Executing ${execState.activeToolName}…"
-                                OrbState.SPEAKING -> "Speaking response…"
-                                OrbState.SUCCESS -> "Verified & Completed"
-                                OrbState.ERROR -> "Attention Required"
-                                OrbState.IDLE -> "Tap Orb to Speak"
-                            },
+                            text = orbLabel,
                             style = MaterialTheme.typography.labelLarge,
-                            color = ElectricCyan
+                            color = if (effectiveOrbState == OrbState.ERROR && voiceState.error != null) CrimsonAlert else ElectricCyan
                         )
 
+                        Spacer(Modifier.height(6.dp))
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            StatusPill(
+                                label = "Speech: ${voiceState.backendMode.label}",
+                                color = if (voiceState.isRecognitionAvailable) EmeraldSuccess else AmberWarning,
+                                modifier = Modifier.testTag("speech_backend_pill")
+                            )
+                            voiceState.detectedSpokenLocale?.takeIf { it.isNotBlank() }?.let { loc ->
+                                StatusPill(
+                                    label = "Spoken: $loc",
+                                    color = NeuralViolet,
+                                    modifier = Modifier.testTag("spoken_locale_pill")
+                                )
+                            }
+                        }
+
                         // Active listening transcript & controls
-                        AnimatedVisibility(visible = voiceState.isListening) {
+                        AnimatedVisibility(visible = voiceState.isListening || voiceState.isStarting) {
                             Column(
                                 modifier = Modifier
                                     .fillMaxWidth()
@@ -370,7 +391,8 @@ fun DashboardScreen(
                                     Text(
                                         text = "\"${voiceState.partialTranscript}\"",
                                         style = MaterialTheme.typography.bodyLarge,
-                                        color = MaterialTheme.colorScheme.onBackground
+                                        color = MaterialTheme.colorScheme.onBackground,
+                                        modifier = Modifier.testTag("partial_transcript_text")
                                     )
                                 }
                                 Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -390,6 +412,64 @@ fun DashboardScreen(
                                         Icon(Icons.Default.Close, contentDescription = null, modifier = Modifier.size(18.dp))
                                         Spacer(Modifier.width(6.dp))
                                         Text("Cancel")
+                                    }
+                                }
+                            }
+                        }
+
+                        // Voice Recognition error & recovery panel (e.g., Error 11, 14, 9, 10, 7)
+                        AnimatedVisibility(
+                            visible = !voiceState.isListening && !voiceState.isStarting && voiceState.error != null
+                        ) {
+                            voiceState.error?.let { voiceErr ->
+                                GlassCard(
+                                    accentBorder = CrimsonAlert.copy(alpha = 0.7f),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(top = 10.dp)
+                                        .testTag("voice_error_card")
+                                ) {
+                                    Row(
+                                        verticalAlignment = Alignment.Top,
+                                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.Warning,
+                                            contentDescription = null,
+                                            tint = AmberWarning,
+                                            modifier = Modifier.size(20.dp)
+                                        )
+                                        Text(
+                                            text = voiceErr,
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurface
+                                        )
+                                    }
+                                    Spacer(Modifier.height(8.dp))
+                                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                        if (voiceState.lastErrorCode == android.speech.SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS) {
+                                            OutlinedButton(
+                                                onClick = { micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO) },
+                                                modifier = Modifier.testTag("grant_mic_button")
+                                            ) {
+                                                Text("Grant Microphone")
+                                            }
+                                        } else if (voiceState.canRetry) {
+                                            OutlinedButton(
+                                                onClick = { viewModel.retryVoiceCapture() },
+                                                modifier = Modifier.testTag("retry_voice_button")
+                                            ) {
+                                                Icon(Icons.Default.Replay, contentDescription = null, modifier = Modifier.size(16.dp))
+                                                Spacer(Modifier.width(6.dp))
+                                                Text("Retry Voice")
+                                            }
+                                        }
+                                        OutlinedButton(
+                                            onClick = { viewModel.openOfflineSpeechSettings() },
+                                            modifier = Modifier.testTag("voice_settings_cta")
+                                        ) {
+                                            Text("Voice Settings")
+                                        }
                                     }
                                 }
                             }

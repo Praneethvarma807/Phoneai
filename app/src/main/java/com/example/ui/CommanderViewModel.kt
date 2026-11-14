@@ -207,10 +207,12 @@ class CommanderViewModel(application: Application) : AndroidViewModel(applicatio
             language = settings.value.speechLanguage,
             onResult = { transcript ->
                 _wakeBannerMessage.value = null
+                val detectedTag = voiceListeningState.value.detectedSpokenLocale
+                    ?: settings.value.speechLanguage.name
                 viewModelScope.launch {
                     container.commandOrchestrator.processCommand(
                         rawCommand = transcript,
-                        inputLanguage = settings.value.speechLanguage.name,
+                        inputLanguage = detectedTag,
                         onComplete = {
                             if (settings.value.wakeWordEnabled && settings.value.continuousListeningEnabled) {
                                 WakeWordForegroundService.resume(context)
@@ -230,6 +232,10 @@ class CommanderViewModel(application: Application) : AndroidViewModel(applicatio
         )
     }
 
+    fun retryVoiceCapture() {
+        startVoiceCapture(afterWakeWord = false)
+    }
+
     fun stopVoiceCapture() {
         container.voiceRecognitionManager.stopListening()
     }
@@ -238,6 +244,23 @@ class CommanderViewModel(application: Application) : AndroidViewModel(applicatio
         container.voiceRecognitionManager.cancelListening()
         container.commandOrchestrator.updateOrbState(OrbState.IDLE)
         _wakeBannerMessage.value = null
+    }
+
+    fun onAppBackgrounded() {
+        if (voiceListeningState.value.isListening || voiceListeningState.value.isStarting) {
+            cancelVoiceCapture()
+        }
+    }
+
+    fun refreshSpeechCapabilities() {
+        container.voiceRecognitionManager.refreshCapabilitiesAsync(settings.value.speechLanguage)
+    }
+
+    fun triggerSpeechModelDownload(language: SpeechLanguageOption = settings.value.speechLanguage) {
+        val triggered = container.voiceRecognitionManager.triggerLanguageModelDownload(language)
+        if (!triggered) {
+            openOfflineSpeechSettings()
+        }
     }
 
     fun confirmPendingAction() {

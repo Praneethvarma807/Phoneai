@@ -195,24 +195,37 @@ class WakeWordForegroundService : Service() {
         container: com.example.AppContainer,
         sensitivity: Float
     ): String? {
+        val voiceManager = container.voiceRecognitionManager
+        if (voiceManager.isCurrentlyListening() || voiceManager.isRateLimited()) {
+            return null
+        }
+        val caps = voiceManager.state.value
+        if (!caps.isRecognitionAvailable) {
+            return null
+        }
         val resultDeferred = kotlinx.coroutines.CompletableDeferred<String?>()
-        container.voiceRecognitionManager.startListening(
+        voiceManager.startListening(
             language = com.example.domain.model.SpeechLanguageOption.EN_IN,
             onResult = { transcript ->
-                if (WakeWordMatcher.matchesTranscript(transcript, sensitivity)) {
-                    resultDeferred.complete(transcript)
-                } else {
-                    resultDeferred.complete(null)
+                if (!resultDeferred.isCompleted) {
+                    if (WakeWordMatcher.matchesTranscript(transcript, sensitivity)) {
+                        resultDeferred.complete(transcript)
+                    } else {
+                        resultDeferred.complete(null)
+                    }
                 }
             },
             onError = {
-                resultDeferred.complete(null)
-            }
+                if (!resultDeferred.isCompleted) {
+                    resultDeferred.complete(null)
+                }
+            },
+            allowBusyRetry = false
         )
         return kotlinx.coroutines.withTimeoutOrNull(2600L) {
             resultDeferred.await()
         }.also {
-            container.voiceRecognitionManager.cancelListening()
+            voiceManager.cancelListening()
         }
     }
 

@@ -248,10 +248,40 @@ fun SettingsScreen(
                     }
                     Spacer(Modifier.height(6.dp))
                     Text(
-                        text = "Auto mode detects English, Telugu, Hindi, Tamil, Kannada, Malayalam & mixed-language speech/text dynamically.",
+                        text = "Auto mode detects English (IN/US), Telugu, Hindi, Tamil, Kannada, Malayalam & mixed-language speech/text dynamically.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
+                    Spacer(Modifier.height(6.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        StatusPill(
+                            label = "Engine: ${voiceState.backendMode.label}",
+                            color = if (voiceState.isRecognitionAvailable) EmeraldSuccess else AmberWarning
+                        )
+                        val selectedSupport = if (settings.speechLanguage == SpeechLanguageOption.AUTO) {
+                            null
+                        } else {
+                            voiceState.languageSupportMap[settings.speechLanguage.code]
+                        }
+                        if (selectedSupport != null) {
+                            StatusPill(
+                                label = "${settings.speechLanguage.code}: ${selectedSupport.label}",
+                                color = when (selectedSupport) {
+                                    com.example.domain.model.LanguageSupportStatus.VERIFIED_OFFLINE -> EmeraldSuccess
+                                    com.example.domain.model.LanguageSupportStatus.VERIFIED_ONLINE_ONLY -> ElectricCyan
+                                    else -> AmberWarning
+                                }
+                            )
+                        }
+                    }
+                    voiceState.servicePackageName?.let { pkg ->
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            text = "Active Recognition Provider: $pkg",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
                     Spacer(Modifier.height(8.dp))
                     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                         SpeechLanguageOption.entries.chunked(2).forEach { pair ->
@@ -280,9 +310,34 @@ fun SettingsScreen(
                         Spacer(Modifier.height(6.dp))
                         Text(warn, style = MaterialTheme.typography.bodySmall, color = AmberWarning)
                     }
+                    voiceState.modelDownloadStatus?.let { dlMsg ->
+                        Spacer(Modifier.height(4.dp))
+                        Text(dlMsg, style = MaterialTheme.typography.bodySmall, color = ElectricCyan)
+                    }
                     Spacer(Modifier.height(6.dp))
-                    OutlinedButton(onClick = { viewModel.openOfflineSpeechSettings() }) {
-                        Text("Manage Offline Language Packs")
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        OutlinedButton(
+                            onClick = { viewModel.triggerSpeechModelDownload() },
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text("Download Voice Pack", maxLines = 1)
+                        }
+                        OutlinedButton(
+                            onClick = { viewModel.openOfflineSpeechSettings() },
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text("Voice Settings", maxLines = 1)
+                        }
+                    }
+                    Spacer(Modifier.height(4.dp))
+                    OutlinedButton(
+                        onClick = { viewModel.refreshSpeechCapabilities() },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("Re-check Speech Service Support")
                     }
 
                     Spacer(Modifier.height(10.dp))

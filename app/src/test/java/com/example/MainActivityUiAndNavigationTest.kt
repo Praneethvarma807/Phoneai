@@ -43,6 +43,9 @@ class MainActivityUiAndNavigationTest {
 
         // Dashboard initial render
         composeTestRule.onNodeWithTag("ai_orb_button").assertIsDisplayed()
+        composeTestRule.onNodeWithTag("dashboard_lazy_column")
+            .performScrollToNode(hasTestTag("speech_backend_pill"))
+        composeTestRule.onNodeWithTag("speech_backend_pill").assertIsDisplayed()
         composeTestRule.onNodeWithTag("command_input_field").assertIsDisplayed()
 
         // Execute a mixed command via text field
@@ -73,6 +76,9 @@ class MainActivityUiAndNavigationTest {
 
         composeTestRule.onNodeWithTag("nav_settings").performClick()
         composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("settings_lazy_column")
+            .performScrollToNode(hasTestTag("lang_chip_EN_US"))
+        composeTestRule.onNodeWithTag("lang_chip_EN_US").assertIsDisplayed()
         composeTestRule.onNodeWithTag("settings_lazy_column")
             .performScrollToNode(hasTestTag("lang_chip_TE_IN"))
         composeTestRule.onNodeWithTag("lang_chip_TE_IN").assertIsDisplayed()
