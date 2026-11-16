@@ -43,27 +43,39 @@ jobs:
         with:
           gradle-version: '9.3.1'
 
-      # Optional: configure DEBUG_KEYSTORE_* secrets once to keep debug APK signing stable across CI runs.
-      - name: Configure persistent debug signing (optional)
+      - name: Configure persistent debug signing identity (never generate ephemeral keys)
         env:
           DEBUG_KEYSTORE_BASE64: ${{ secrets.DEBUG_KEYSTORE_BASE64 }}
           DEBUG_STORE_PASSWORD: ${{ secrets.DEBUG_STORE_PASSWORD }}
           DEBUG_KEY_ALIAS: ${{ secrets.DEBUG_KEY_ALIAS }}
           DEBUG_KEY_PASSWORD: ${{ secrets.DEBUG_KEY_PASSWORD }}
         run: |
+          KEYSTORE_PATH="$RUNNER_TEMP/phoneai-debug.keystore"
           if [ -n "$DEBUG_KEYSTORE_BASE64" ]; then
             : "${DEBUG_STORE_PASSWORD:?Set DEBUG_STORE_PASSWORD when DEBUG_KEYSTORE_BASE64 is configured}"
             : "${DEBUG_KEY_PASSWORD:?Set DEBUG_KEY_PASSWORD when DEBUG_KEYSTORE_BASE64 is configured}"
-            KEYSTORE_PATH="$RUNNER_TEMP/phoneai-debug.keystore"
             printf '%s' "$DEBUG_KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE_PATH"
-            test -s "$KEYSTORE_PATH"
-            echo "DEBUG_KEYSTORE_PATH=$KEYSTORE_PATH" >> "$GITHUB_ENV"
-            echo "DEBUG_STORE_PASSWORD=$DEBUG_STORE_PASSWORD" >> "$GITHUB_ENV"
-            echo "DEBUG_KEY_ALIAS=${DEBUG_KEY_ALIAS:-androiddebugkey}" >> "$GITHUB_ENV"
-            echo "DEBUG_KEY_PASSWORD=$DEBUG_KEY_PASSWORD" >> "$GITHUB_ENV"
+            KEY_ALIAS="${DEBUG_KEY_ALIAS:-androiddebugkey}"
+            STORE_PASS="$DEBUG_STORE_PASSWORD"
+            KEY_PASS="$DEBUG_KEY_PASSWORD"
+            SIGN_SOURCE="GitHub Secret DEBUG_KEYSTORE_BASE64"
+          elif [ -f "debug.keystore.base64" ]; then
+            base64 --decode debug.keystore.base64 > "$KEYSTORE_PATH"
+            KEY_ALIAS="androiddebugkey"
+            STORE_PASS="android"
+            KEY_PASS="android"
+            SIGN_SOURCE="Repository persistent debug.keystore.base64"
           else
-            echo "::notice::No persistent debug keystore secret configured; Gradle will use its standard debug signing."
+            echo "::error::Neither DEBUG_KEYSTORE_BASE64 secret nor debug.keystore.base64 was found. Refusing to generate a random per-build debug key."
+            exit 1
           fi
+          test -s "$KEYSTORE_PATH"
+          echo "DEBUG_KEYSTORE_PATH=$KEYSTORE_PATH" >> "$GITHUB_ENV"
+          echo "DEBUG_STORE_PASSWORD=$STORE_PASS" >> "$GITHUB_ENV"
+          echo "DEBUG_KEY_ALIAS=$KEY_ALIAS" >> "$GITHUB_ENV"
+          echo "DEBUG_KEY_PASSWORD=$KEY_PASS" >> "$GITHUB_ENV"
+          echo "Debug signing identity source: $SIGN_SOURCE"
+          keytool -list -keystore "$KEYSTORE_PATH" -storepass "$STORE_PASS" -alias "$KEY_ALIAS" | grep -E "Alias name:|Certificate fingerprint|SHA256:" || true
 
       - name: Run unit tests, Lint, and build Debug APK
         run: |
@@ -73,21 +85,52 @@ jobs:
             gradle clean testDebugUnitTest lintDebug assembleDebug --stacktrace
           fi
 
-      - name: Verify Debug APK signature, package metadata, and SHA-256
+      - name: Verify Debug APK integrity, 16KB alignment, signature, ABIs, and metadata
         run: |
-          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT}}"
+          BUILD_TOOLS="$SDK_ROOT/build-tools/36.0.0"
           APK="app/build/outputs/apk/debug/app-debug.apk"
           test -f "$APK"
           test -s "$APK"
-          ls -lh "$APK"
-          "$SDK_ROOT/build-tools/36.0.0/apksigner" verify --verbose --print-certs "$APK"
-          "$SDK_ROOT/build-tools/36.0.0/aapt2" dump badging "$APK" | head -n 5
-          sha256sum "$APK"
 
-      - name: Upload Debug APK artifact
+          "$BUILD_TOOLS/zipalign" -c -P 16 4 "$APK"
+          "$BUILD_TOOLS/apksigner" verify --verbose --min-sdk-version 26 --max-sdk-version 36 --print-certs "$APK"
+
+          BADGING="$("$BUILD_TOOLS/aapt2" dump badging "$APK")"
+          echo "$BADGING" | head -n 10
+          VER_CODE="$(echo "$BADGING" | sed -n "s/.*versionCode='\([^']*\)'.*/\1/p" | head -n 1)"
+          VER_NAME="$(echo "$BADGING" | sed -n "s/.*versionName='\([^']*\)'.*/\1/p" | head -n 1)"
+          echo "APP_VERSION_CODE=${VER_CODE:-2}" >> "$GITHUB_ENV"
+          echo "APP_VERSION_NAME=${VER_NAME:-1.0.1}" >> "$GITHUB_ENV"
+
+          echo "=== Packaged native ABIs ==="
+          unzip -l "$APK" | grep "lib/"
+          if unzip -l "$APK" | grep -qE "lib/(armeabi-v7a|x86)/"; then
+            echo "::error::Incomplete 32-bit ABI detected without LiteRT-LM native support."
+            exit 1
+          fi
+          for abi in arm64-v8a x86_64; do
+            unzip -l "$APK" | grep -q "lib/$abi/liblitertlm_jni.so"
+            unzip -l "$APK" | grep -q "lib/$abi/liblitert_jni.so"
+            unzip -l "$APK" | grep -q "lib/$abi/libmlkit_google_ocr_pipeline.so"
+          done
+
+          ls -lh "$APK"
+          SHA256_SUM="$(sha256sum "$APK" | awk '{print $1}')"
+          echo "Debug APK SHA-256: $SHA256_SUM"
+
+          {
+            echo "### Debug APK Verification Passed"
+            echo "- Version: \`${VER_NAME} (${VER_CODE})\` | Package: \`com.aistudio.aiphonecommander.kxmpzq\`"
+            echo "- ABIs: \`arm64-v8a\`, \`x86_64\` | 16 KB page aligned: \`yes\`"
+            echo "- Debug APK SHA-256: \`$SHA256_SUM\`"
+            echo "- Note: GitHub Actions wraps artifact downloads in a \`.zip\` file; extract \`app-debug.apk\` before installing on Android."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload verified Debug APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ai-phone-commander-debug-apk
+          name: ai-commander-v${{ env.APP_VERSION_NAME }}-vc${{ env.APP_VERSION_CODE }}-debug-apk
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
 
@@ -100,10 +143,12 @@ jobs:
         run: |
           : "${STORE_PASSWORD:?Set STORE_PASSWORD when RELEASE_KEYSTORE_BASE64 is configured}"
           : "${KEY_PASSWORD:?Set KEY_PASSWORD when RELEASE_KEYSTORE_BASE64 is configured}"
-          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT}}"
+          BUILD_TOOLS="$SDK_ROOT/build-tools/36.0.0"
           KEYSTORE_PATH="$RUNNER_TEMP/phoneai-release.jks"
           printf '%s' "$RELEASE_KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE_PATH"
           test -s "$KEYSTORE_PATH"
+          keytool -list -keystore "$KEYSTORE_PATH" -storepass "$STORE_PASSWORD" -alias upload >/dev/null
           export KEYSTORE_PATH
           if [ -x ./gradlew ]; then
             ./gradlew assembleRelease --stacktrace
@@ -112,14 +157,18 @@ jobs:
           fi
           RELEASE_APK="app/build/outputs/apk/release/app-release.apk"
           test -f "$RELEASE_APK"
+          test -s "$RELEASE_APK"
+          "$BUILD_TOOLS/zipalign" -c -P 16 4 "$RELEASE_APK"
+          "$BUILD_TOOLS/apksigner" verify --verbose --min-sdk-version 26 --max-sdk-version 36 --print-certs "$RELEASE_APK"
+          "$BUILD_TOOLS/aapt2" dump badging "$RELEASE_APK" | head -n 10
+          unzip -l "$RELEASE_APK" | grep "lib/"
           ls -lh "$RELEASE_APK"
-          "$SDK_ROOT/build-tools/36.0.0/apksigner" verify --verbose --print-certs "$RELEASE_APK"
           sha256sum "$RELEASE_APK"
 
-      - name: Upload Release APK artifact (optional)
+      - name: Upload verified Release APK artifact (optional)
         if: ${{ env.RELEASE_KEYSTORE_BASE64 != '' }}
         uses: actions/upload-artifact@v4
         with:
-          name: ai-phone-commander-release-apk
+          name: ai-commander-v${{ env.APP_VERSION_NAME }}-vc${{ env.APP_VERSION_CODE }}-release-apk
           path: app/build/outputs/apk/release/app-release.apk
           if-no-files-found: warn
