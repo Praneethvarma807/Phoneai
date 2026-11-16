@@ -37,8 +37,9 @@ Output APK: `app/build/outputs/apk/debug/app-debug.apk`.
 
 - **Package ID:** `com.aistudio.aiphonecommander.kxmpzq` (`minSdk = 26`, `targetSdk = 36`, `versionCode = 2`, `versionName = "1.0.1"`).
 - **Supported ABIs:** `arm64-v8a` (64-bit phones/tablets) and `x86_64` (64-bit emulators). 32-bit-only `armeabi-v7a` devices are intentionally excluded because `litertlm-android` provides 64-bit native binaries only.
-- **GitHub Actions Downloads:** GitHub Actions wraps each uploaded artifact in a `.zip` file (`ai-commander-v<versionName>-vc<versionCode>-debug-apk.zip`). Extract `app-debug.apk` from the `.zip` before installing on Android.
+- **GitHub Actions Downloads:** GitHub Actions wraps each uploaded artifact in a `.zip` file (`AI-Commander-v<versionName>-vc<versionCode>-debug-apk.zip`), containing `AI-Commander-debug.apk`, `APK-SHA256.txt`, and `APK-Verification-Report.txt`. Extract `AI-Commander-debug.apk` from the `.zip` before installing on Android.
 - **Persistent Signing & `INSTALL_FAILED_UPDATE_INCOMPATIBLE`:** Android allows in-place updates (preserving Room history, notes, reminders, and settings) only when the new APK has the exact same signing certificate as the installed app.
-  - Debug CI builds use `DEBUG_KEYSTORE_BASE64` (if configured) or fall back to the repository's persistent `debug.keystore.base64`, preventing per-run random debug keys.
-  - Release CI builds require `RELEASE_KEYSTORE_BASE64`, `STORE_PASSWORD`, and `KEY_PASSWORD` (`keyAlias = "upload"`).
+  - Debug CI builds decode `DEBUG_KEYSTORE_BASE64` (with `DEBUG_STORE_PASSWORD`/`DEBUG_KEYSTORE_PASSWORD`, `DEBUG_KEY_ALIAS`, `DEBUG_KEY_PASSWORD`) or fall back to the repository's persistent `debug.keystore.base64`, preventing per-run random debug keys.
+  - Release CI builds require `RELEASE_KEYSTORE_BASE64`, `STORE_PASSWORD` (or `RELEASE_KEYSTORE_PASSWORD`), and `KEY_PASSWORD` (or `RELEASE_KEY_PASSWORD`) for keystore alias `upload`.
   - If your phone already has an older build signed with a different certificate, Android will show **"App not installed"**. Export/back up any notes or local `.litertlm` files first, manually uninstall the older mismatched app, and then install the new APK cleanly.
+
