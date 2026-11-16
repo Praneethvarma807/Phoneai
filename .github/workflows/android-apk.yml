@@ -25,19 +25,59 @@ jobs:
 
       - name: Set up Android SDK packages and accept licenses
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
+          trap 'echo "::error::Android SDK setup failed at line $LINENO (exit code $?)." >&2' ERR
+          echo "=== Step: Set up Android SDK packages and accept licenses ==="
+
           SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
-          SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
-          if [ ! -x "$SDKMANAGER" ]; then
+          echo "Resolved SDK_ROOT=$SDK_ROOT"
+          if [ ! -d "$SDK_ROOT" ]; then
+            echo "::error::Android SDK directory does not exist at '$SDK_ROOT'."
+            exit 1
+          fi
+
+          SDKMANAGER=""
+          if [ -x "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" ]; then
+            SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          else
+            for candidate in "$SDK_ROOT"/cmdline-tools/*/bin/sdkmanager "$SDK_ROOT/tools/bin/sdkmanager"; do
+              if [ -x "$candidate" ]; then
+                SDKMANAGER="$candidate"
+                break
+              fi
+            done
+          fi
+          if [ -z "$SDKMANAGER" ] && command -v sdkmanager >/dev/null 2>&1; then
             SDKMANAGER="$(command -v sdkmanager)"
           fi
-          yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses > /dev/null || true
+          if [ -z "$SDKMANAGER" ] || [ ! -x "$SDKMANAGER" ]; then
+            echo "::error::sdkmanager binary not found under '$SDK_ROOT' or PATH."
+            ls -la "$SDK_ROOT" || true
+            exit 1
+          fi
+          echo "Using sdkmanager: $SDKMANAGER"
+
+          echo "Accepting Android SDK licenses..."
+          set +o pipefail
+          yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses >/dev/null 2>&1 || true
+          set -o pipefail
+
+          echo "Installing platform-tools, platforms;android-36.1, build-tools;36.0.0..."
           "$SDKMANAGER" --sdk_root="$SDK_ROOT" --install \
             "platform-tools" \
             "platforms;android-36.1" \
             "build-tools;36.0.0"
+
+          for required_dir in "$SDK_ROOT/platform-tools" "$SDK_ROOT/platforms/android-36.1" "$SDK_ROOT/build-tools/36.0.0"; do
+            if [ ! -d "$required_dir" ]; then
+              echo "::error::Expected Android SDK directory missing after install: $required_dir"
+              exit 1
+            fi
+          done
+
           echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
           echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "Android SDK setup verified."
 
       - name: Set up Gradle 9.3.1
         uses: gradle/actions/setup-gradle@v4
@@ -52,9 +92,27 @@ jobs:
           DEBUG_KEY_ALIAS: ${{ secrets.DEBUG_KEY_ALIAS }}
           DEBUG_KEY_PASSWORD: ${{ secrets.DEBUG_KEY_PASSWORD }}
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
+          trap 'echo "::error::Debug signing setup failed at line $LINENO (exit code $?)." >&2' ERR
+          echo "=== Step: Configure and validate persistent debug signing identity ==="
+
+          echo "Diagnostic: RUNNER_TEMP present=$([ -n "${RUNNER_TEMP:-}" ] && echo yes || echo no)"
+          echo "Diagnostic: DEBUG_KEYSTORE_BASE64=$([ -n "${DEBUG_KEYSTORE_BASE64:-}" ] && echo set || echo unset)"
+          echo "Diagnostic: DEBUG_STORE_PASSWORD=$([ -n "${DEBUG_STORE_PASSWORD:-}" ] && echo set || echo unset)"
+          echo "Diagnostic: DEBUG_KEYSTORE_PASSWORD=$([ -n "${DEBUG_KEYSTORE_PASSWORD:-}" ] && echo set || echo unset)"
+          echo "Diagnostic: DEBUG_KEY_ALIAS=$([ -n "${DEBUG_KEY_ALIAS:-}" ] && echo set || echo unset)"
+          echo "Diagnostic: DEBUG_KEY_PASSWORD=$([ -n "${DEBUG_KEY_PASSWORD:-}" ] && echo set || echo unset)"
+          echo "Diagnostic: repo file debug.keystore.base64=$([ -f debug.keystore.base64 ] && echo present || echo missing)"
+
+          if [ -z "${RUNNER_TEMP:-}" ] || [ ! -d "$RUNNER_TEMP" ]; then
+            echo "::error::RUNNER_TEMP directory is missing or invalid."
+            exit 1
+          fi
+
           KEYSTORE_PATH="$RUNNER_TEMP/phoneai-debug.keystore"
-          if [ -n "$DEBUG_KEYSTORE_BASE64" ]; then
+          rm -f "$KEYSTORE_PATH"
+
+          if [ -n "${DEBUG_KEYSTORE_BASE64:-}" ]; then
             STORE_PASS="${DEBUG_STORE_PASSWORD:-${DEBUG_KEYSTORE_PASSWORD:-}}"
             KEY_PASS="${DEBUG_KEY_PASSWORD:-}"
             KEY_ALIAS="${DEBUG_KEY_ALIAS:-androiddebugkey}"
@@ -66,10 +124,28 @@ jobs:
               echo "::error::DEBUG_KEY_PASSWORD secret must be set when DEBUG_KEYSTORE_BASE64 is configured."
               exit 1
             fi
-            printf '%s' "$DEBUG_KEYSTORE_BASE64" | tr -d '\r\n ' | base64 --decode > "$KEYSTORE_PATH"
+            echo "Decoding DEBUG_KEYSTORE_BASE64 secret into $KEYSTORE_PATH..."
+            if ! printf '%s' "$DEBUG_KEYSTORE_BASE64" | tr -d '\r\n ' | base64 --decode > "$KEYSTORE_PATH" 2>"$RUNNER_TEMP/debug-b64.err"; then
+              cat "$RUNNER_TEMP/debug-b64.err" >&2 || true
+              rm -f "$RUNNER_TEMP/debug-b64.err" "$KEYSTORE_PATH"
+              echo "::error::Failed to base64-decode DEBUG_KEYSTORE_BASE64 secret. Ensure the secret contains raw single-line Base64 (from 'base64 -w 0 debug.keystore')."
+              exit 1
+            fi
+            rm -f "$RUNNER_TEMP/debug-b64.err"
             SIGN_SOURCE="GitHub Secret DEBUG_KEYSTORE_BASE64"
           elif [ -f "debug.keystore.base64" ]; then
-            tr -d '\r\n ' < debug.keystore.base64 | base64 --decode > "$KEYSTORE_PATH"
+            if [ ! -s "debug.keystore.base64" ]; then
+              echo "::error::Repository file debug.keystore.base64 exists but is empty."
+              exit 1
+            fi
+            echo "Decoding repository debug.keystore.base64 into $KEYSTORE_PATH..."
+            if ! tr -d '\r\n ' < debug.keystore.base64 | base64 --decode > "$KEYSTORE_PATH" 2>"$RUNNER_TEMP/debug-b64.err"; then
+              cat "$RUNNER_TEMP/debug-b64.err" >&2 || true
+              rm -f "$RUNNER_TEMP/debug-b64.err" "$KEYSTORE_PATH"
+              echo "::error::Failed to base64-decode repository file debug.keystore.base64."
+              exit 1
+            fi
+            rm -f "$RUNNER_TEMP/debug-b64.err"
             KEY_ALIAS="androiddebugkey"
             STORE_PASS="android"
             KEY_PASS="android"
@@ -83,7 +159,7 @@ jobs:
               echo "1. Encode your debug keystore: \`base64 -w 0 ~/.android/debug.keystore\`"
               echo "2. Add GitHub Repository Secrets (Settings -> Secrets and variables -> Actions):"
               echo "   - \`DEBUG_KEYSTORE_BASE64\`"
-              echo "   - \`DEBUG_STORE_PASSWORD\` (e.g. \`android\`)"
+              echo "   - \`DEBUG_STORE_PASSWORD\` (or \`DEBUG_KEYSTORE_PASSWORD\`, e.g. \`android\`)"
               echo "   - \`DEBUG_KEY_ALIAS\` (e.g. \`androiddebugkey\`)"
               echo "   - \`DEBUG_KEY_PASSWORD\` (e.g. \`android\`)"
             } >> "$GITHUB_STEP_SUMMARY"
@@ -95,67 +171,220 @@ jobs:
             echo "::error::Decoded debug keystore at $KEYSTORE_PATH is missing or empty."
             exit 1
           fi
+          echo "Decoded debug keystore size: $(wc -c < "$KEYSTORE_PATH") bytes"
 
-          # Verify file is a valid Java keystore and alias exists without exposing credentials
-          keytool -list -keystore "$KEYSTORE_PATH" -storepass "$STORE_PASS" >/dev/null
-          KEYTOOL_INFO="$(keytool -list -v -keystore "$KEYSTORE_PATH" -storepass "$STORE_PASS" -alias "$KEY_ALIAS")"
+          cat <<'JAVA_EOF' > "$RUNNER_TEMP/VerifyKeystore.java"
+          import java.io.File;
+          import java.security.Key;
+          import java.security.KeyStore;
+          import java.security.MessageDigest;
+          import java.security.cert.Certificate;
+          import java.security.cert.X509Certificate;
+          import java.util.Collections;
+          import java.util.List;
+
+          public class VerifyKeystore {
+              public static void main(String[] args) {
+                  String path = System.getenv("VK_PATH");
+                  String storePass = System.getenv("VK_STORE_PASS");
+                  String alias = System.getenv("VK_ALIAS");
+                  String keyPass = System.getenv("VK_KEY_PASS");
+                  if (path == null || path.isEmpty() || storePass == null || storePass.isEmpty()
+                          || alias == null || alias.isEmpty() || keyPass == null || keyPass.isEmpty()) {
+                      System.err.println("::error::VerifyKeystore missing required environment variables.");
+                      System.exit(1);
+                  }
+                  File file = new File(path);
+                  if (!file.isFile() || file.length() == 0) {
+                      System.err.println("::error::Keystore file missing or empty at " + path);
+                      System.exit(1);
+                  }
+                  try {
+                      KeyStore ks = KeyStore.getInstance(file, storePass.toCharArray());
+                      List<String> aliases = Collections.list(ks.aliases());
+                      System.out.println("Keystore type: " + ks.getType() + " | Entry count: " + aliases.size());
+                      if (!ks.containsAlias(alias)) {
+                          System.err.println("::error::Alias '" + alias + "' not found in keystore. Available aliases: " + aliases);
+                          System.exit(1);
+                      }
+                      if (!ks.isKeyEntry(alias)) {
+                          System.err.println("::error::Alias '" + alias + "' is not a private key entry.");
+                          System.exit(1);
+                      }
+                      Key key = ks.getKey(alias, keyPass.toCharArray());
+                      if (key == null) {
+                          System.err.println("::error::Private key for alias '" + alias + "' could not be unlocked.");
+                          System.exit(1);
+                      }
+                      Certificate cert = ks.getCertificate(alias);
+                      if (cert == null) {
+                          System.err.println("::error::Certificate missing for alias '" + alias + "'.");
+                          System.exit(1);
+                      }
+                      byte[] digest = MessageDigest.getInstance("SHA-256").digest(cert.getEncoded());
+                      StringBuilder hex = new StringBuilder();
+                      for (int i = 0; i < digest.length; i++) {
+                          if (i > 0) hex.append(':');
+                          hex.append(String.format("%02X", digest[i]));
+                      }
+                      System.out.println("Verified alias: " + alias);
+                      if (cert instanceof X509Certificate x509) {
+                          System.out.println("Certificate Subject: " + x509.getSubjectX500Principal().getName());
+                          System.out.println("Valid from: " + x509.getNotBefore() + " until: " + x509.getNotAfter());
+                      }
+                      System.out.println("Certificate SHA-256: " + hex);
+                  } catch (Exception e) {
+                      System.err.println("::error::Keystore validation failed (" + e.getClass().getSimpleName() + "): " + e.getMessage());
+                      System.exit(1);
+                  }
+              }
+          }
+          JAVA_EOF
+
+          echo "Validating debug keystore format, store password, alias, and key password..."
+          VK_PATH="$KEYSTORE_PATH" \
+          VK_STORE_PASS="$STORE_PASS" \
+          VK_ALIAS="$KEY_ALIAS" \
+          VK_KEY_PASS="$KEY_PASS" \
+            java "$RUNNER_TEMP/VerifyKeystore.java"
 
           echo "DEBUG_KEYSTORE_PATH=$KEYSTORE_PATH" >> "$GITHUB_ENV"
           echo "DEBUG_STORE_PASSWORD=$STORE_PASS" >> "$GITHUB_ENV"
           echo "DEBUG_KEY_ALIAS=$KEY_ALIAS" >> "$GITHUB_ENV"
           echo "DEBUG_KEY_PASSWORD=$KEY_PASS" >> "$GITHUB_ENV"
-
           echo "Debug signing identity source: $SIGN_SOURCE"
-          echo "$KEYTOOL_INFO" | grep -E "Alias name:|Entry type:|Valid from:|SHA256:"
 
       - name: Run unit tests, Lint, and build Debug APK
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
+          trap 'echo "::error::Gradle test/lint/debug build failed at line $LINENO (exit code $?)." >&2' ERR
+          echo "=== Step: Run unit tests, Lint, and build Debug APK ==="
+
+          for required_file in settings.gradle.kts build.gradle.kts app/build.gradle.kts app/src/main/AndroidManifest.xml; do
+            if [ ! -f "$required_file" ]; then
+              echo "::error::Required project file missing: $required_file"
+              exit 1
+            fi
+          done
+
+          if ! grep -q "DEBUG_KEYSTORE_PATH" app/build.gradle.kts; then
+            echo "::error::app/build.gradle.kts does not reference DEBUG_KEYSTORE_PATH for persistent CI debug signing."
+            exit 1
+          fi
+
+          echo "Diagnostic: DEBUG_KEYSTORE_PATH=${DEBUG_KEYSTORE_PATH:-<unset>}"
+          echo "Diagnostic: DEBUG_STORE_PASSWORD=$([ -n "${DEBUG_STORE_PASSWORD:-}" ] && echo set || echo unset)"
+          echo "Diagnostic: DEBUG_KEY_ALIAS=$([ -n "${DEBUG_KEY_ALIAS:-}" ] && echo set || echo unset)"
+          echo "Diagnostic: DEBUG_KEY_PASSWORD=$([ -n "${DEBUG_KEY_PASSWORD:-}" ] && echo set || echo unset)"
+
+          if [ -z "${DEBUG_KEYSTORE_PATH:-}" ] || [ ! -s "$DEBUG_KEYSTORE_PATH" ]; then
+            echo "::error::DEBUG_KEYSTORE_PATH is missing or points to an empty/missing keystore file."
+            exit 1
+          fi
+          if [ -z "${DEBUG_STORE_PASSWORD:-}" ] || [ -z "${DEBUG_KEY_PASSWORD:-}" ]; then
+            echo "::error::DEBUG_STORE_PASSWORD or DEBUG_KEY_PASSWORD is missing in environment."
+            exit 1
+          fi
+
           if [ -x ./gradlew ]; then
+            echo "Using repository ./gradlew"
             ./gradlew --version
             ./gradlew clean testDebugUnitTest lintDebug assembleDebug --stacktrace
-          else
+          elif command -v gradle >/dev/null 2>&1; then
+            echo "Using system gradle: $(command -v gradle)"
             gradle --version
             gradle clean testDebugUnitTest lintDebug assembleDebug --stacktrace
+          else
+            echo "::error::Neither executable ./gradlew nor gradle CLI was found in PATH."
+            exit 1
           fi
 
       - name: Verify Debug APK and prepare artifact deliverables
         run: |
-          set -euo pipefail
-          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT}}"
+          set -Eeuo pipefail
+          trap 'echo "::error::Debug APK verification failed at line $LINENO (exit code $?)." >&2' ERR
+          echo "=== Step: Verify Debug APK and prepare artifact deliverables ==="
+
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          echo "Diagnostic: SDK_ROOT=${SDK_ROOT:-<unset>}"
+          if [ -z "$SDK_ROOT" ] || [ ! -d "$SDK_ROOT" ]; then
+            echo "::error::ANDROID_HOME / ANDROID_SDK_ROOT is not set to a valid Android SDK directory."
+            exit 1
+          fi
+
           BUILD_TOOLS="$SDK_ROOT/build-tools/36.0.0"
+          for tool in zipalign apksigner aapt2; do
+            if [ ! -x "$BUILD_TOOLS/$tool" ]; then
+              echo "::error::Required build-tool missing or not executable: $BUILD_TOOLS/$tool"
+              exit 1
+            fi
+          done
+
           APK="app/build/outputs/apk/debug/app-debug.apk"
+          if [ ! -f "$APK" ] || [ ! -s "$APK" ]; then
+            echo "::error::Expected Debug APK missing or empty at '$APK'."
+            ls -la app/build/outputs/apk/debug 2>&1 || true
+            exit 1
+          fi
+          echo "Found Debug APK: $APK ($(stat -c "%s" "$APK") bytes)"
+
           STAGING_DIR="$RUNNER_TEMP/artifacts/debug"
           mkdir -p "$STAGING_DIR"
 
-          test -f "$APK"
-          test -s "$APK"
-          unzip -t "$APK" >/dev/null
+          echo "Checking APK ZIP archive integrity..."
+          if ! UNZIP_OUT="$(unzip -t "$APK" 2>&1)"; then
+            echo "$UNZIP_OUT" >&2
+            echo "::error::unzip -t reported ZIP integrity errors in $APK."
+            exit 1
+          fi
+          echo "ZIP integrity check passed."
 
-          ZIPALIGN_OUT="$("$BUILD_TOOLS/zipalign" -c -P 16 4 "$APK" 2>&1 || true)"
-          "$BUILD_TOOLS/zipalign" -c -P 16 4 "$APK"
+          echo "Checking 16 KB page-size and 4-byte ZIP alignment (zipalign -c -P 16 4)..."
+          if ! ZIPALIGN_OUT="$("$BUILD_TOOLS/zipalign" -c -P 16 4 "$APK" 2>&1)"; then
+            echo "$ZIPALIGN_OUT" >&2
+            echo "::error::zipalign -c -P 16 4 failed for $APK."
+            exit 1
+          fi
+          echo "zipalign 16 KB alignment check passed."
 
-          APKSIGNER_OUT="$("$BUILD_TOOLS/apksigner" verify --verbose --min-sdk-version 26 --max-sdk-version 36 --print-certs "$APK")"
+          echo "Verifying APK signature and signing certificate..."
+          if ! APKSIGNER_OUT="$("$BUILD_TOOLS/apksigner" verify --verbose --min-sdk-version 26 --max-sdk-version 36 --print-certs "$APK" 2>&1)"; then
+            echo "$APKSIGNER_OUT" >&2
+            echo "::error::apksigner verification failed for $APK."
+            exit 1
+          fi
           echo "$APKSIGNER_OUT"
 
-          BADGING="$("$BUILD_TOOLS/aapt2" dump badging "$APK")"
-          echo "$BADGING" | head -n 12
-          VER_CODE="$(echo "$BADGING" | sed -n "s/.*versionCode='\([^']*\)'.*/\1/p" | head -n 1)"
-          VER_NAME="$(echo "$BADGING" | sed -n "s/.*versionName='\([^']*\)'.*/\1/p" | head -n 1)"
+          echo "Inspecting APK badging metadata..."
+          if ! BADGING="$("$BUILD_TOOLS/aapt2" dump badging "$APK" 2>&1)"; then
+            echo "$BADGING" >&2
+            echo "::error::aapt2 dump badging failed for $APK."
+            exit 1
+          fi
+          sed -n '1,12p' <<< "$BADGING"
+          VER_CODE="$(sed -n "s/.*versionCode='\([^']*\)'.*/\1/p" <<< "$BADGING" | sed -n '1p')"
+          VER_NAME="$(sed -n "s/.*versionName='\([^']*\)'.*/\1/p" <<< "$BADGING" | sed -n '1p')"
           echo "APP_VERSION_CODE=${VER_CODE:-2}" >> "$GITHUB_ENV"
           echo "APP_VERSION_NAME=${VER_NAME:-1.0.1}" >> "$GITHUB_ENV"
 
-          echo "=== Packaged native ABIs ==="
+          echo "=== Checking packaged native ABIs ==="
           ABI_LIST="$(unzip -l "$APK" | grep "lib/" || true)"
+          if [ -z "$ABI_LIST" ]; then
+            echo "::error::No native libraries found under lib/ inside $APK."
+            exit 1
+          fi
           echo "$ABI_LIST"
-          if echo "$ABI_LIST" | grep -qE "lib/(armeabi-v7a|x86)/"; then
+          if grep -qE "lib/(armeabi-v7a|x86)/" <<< "$ABI_LIST"; then
             echo "::error::Incomplete 32-bit ABI detected without LiteRT-LM native support."
             exit 1
           fi
           for abi in arm64-v8a x86_64; do
-            echo "$ABI_LIST" | grep -q "lib/$abi/liblitertlm_jni.so"
-            echo "$ABI_LIST" | grep -q "lib/$abi/liblitert_jni.so"
-            echo "$ABI_LIST" | grep -q "lib/$abi/libmlkit_google_ocr_pipeline.so"
+            for lib in liblitertlm_jni.so liblitert_jni.so libmlkit_google_ocr_pipeline.so; do
+              if ! grep -q "lib/$abi/$lib" <<< "$ABI_LIST"; then
+                echo "::error::Missing required native library lib/$abi/$lib in $APK."
+                exit 1
+              fi
+            done
           done
 
           DELIVERABLE_APK="$STAGING_DIR/AI-Commander-debug.apk"
@@ -168,10 +397,11 @@ jobs:
             echo "File: AI-Commander-debug.apk"
             echo "Size: $APK_BYTES bytes"
             echo "SHA-256: $SHA256_SUM"
+            echo "ZIP Integrity (unzip -t): PASSED"
             echo "16 KB Page-Size Zipalign (-c -P 16 4): PASSED"
             echo ""
             echo "--- Badging Summary ---"
-            echo "$BADGING" | head -n 15
+            sed -n '1,15p' <<< "$BADGING"
             echo ""
             echo "--- Signature Verification (apksigner) ---"
             echo "$APKSIGNER_OUT"
@@ -216,7 +446,16 @@ jobs:
           RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
           RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
+          trap 'echo "::error::Release APK build/verification failed at line $LINENO (exit code $?)." >&2' ERR
+          echo "=== Step: Build and verify signed Release APK (optional) ==="
+
+          echo "Diagnostic: STORE_PASSWORD=$([ -n "${STORE_PASSWORD:-}" ] && echo set || echo unset)"
+          echo "Diagnostic: RELEASE_KEYSTORE_PASSWORD=$([ -n "${RELEASE_KEYSTORE_PASSWORD:-}" ] && echo set || echo unset)"
+          echo "Diagnostic: KEY_PASSWORD=$([ -n "${KEY_PASSWORD:-}" ] && echo set || echo unset)"
+          echo "Diagnostic: RELEASE_KEY_PASSWORD=$([ -n "${RELEASE_KEY_PASSWORD:-}" ] && echo set || echo unset)"
+          echo "Diagnostic: RELEASE_KEY_ALIAS=$([ -n "${RELEASE_KEY_ALIAS:-}" ] && echo set || echo unset)"
+
           RESOLVED_STORE_PASS="${STORE_PASSWORD:-${RELEASE_KEYSTORE_PASSWORD:-}}"
           RESOLVED_KEY_PASS="${KEY_PASSWORD:-${RELEASE_KEY_PASSWORD:-}}"
           RESOLVED_ALIAS="${RELEASE_KEY_ALIAS:-upload}"
@@ -233,20 +472,41 @@ jobs:
             echo "::error::app/build.gradle.kts signingConfigs.release requires keyAlias 'upload', but RELEASE_KEY_ALIAS was set to '$RESOLVED_ALIAS'."
             exit 1
           fi
+          if ! grep -q "create(\"release\")" app/build.gradle.kts; then
+            echo "::error::app/build.gradle.kts does not define signingConfigs release."
+            exit 1
+          fi
 
-          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT}}"
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          if [ -z "$SDK_ROOT" ] || [ ! -d "$SDK_ROOT" ]; then
+            echo "::error::ANDROID_HOME / ANDROID_SDK_ROOT is not set to a valid Android SDK directory."
+            exit 1
+          fi
           BUILD_TOOLS="$SDK_ROOT/build-tools/36.0.0"
+
           KEYSTORE_PATH="$RUNNER_TEMP/phoneai-release.jks"
-          printf '%s' "$RELEASE_KEYSTORE_BASE64" | tr -d '\r\n ' | base64 --decode > "$KEYSTORE_PATH"
+          rm -f "$KEYSTORE_PATH"
+          echo "Decoding RELEASE_KEYSTORE_BASE64 into $KEYSTORE_PATH..."
+          if ! printf '%s' "$RELEASE_KEYSTORE_BASE64" | tr -d '\r\n ' | base64 --decode > "$KEYSTORE_PATH" 2>"$RUNNER_TEMP/release-b64.err"; then
+            cat "$RUNNER_TEMP/release-b64.err" >&2 || true
+            rm -f "$RUNNER_TEMP/release-b64.err" "$KEYSTORE_PATH"
+            echo "::error::Failed to base64-decode RELEASE_KEYSTORE_BASE64 secret."
+            exit 1
+          fi
+          rm -f "$RUNNER_TEMP/release-b64.err"
+
           if [ ! -f "$KEYSTORE_PATH" ] || [ ! -s "$KEYSTORE_PATH" ]; then
             echo "::error::Decoded release keystore at $KEYSTORE_PATH is missing or empty."
             exit 1
           fi
+          echo "Decoded release keystore size: $(wc -c < "$KEYSTORE_PATH") bytes"
 
-          keytool -list -keystore "$KEYSTORE_PATH" -storepass "$RESOLVED_STORE_PASS" >/dev/null
-          RELEASE_KEYTOOL="$(keytool -list -v -keystore "$KEYSTORE_PATH" -storepass "$RESOLVED_STORE_PASS" -alias upload)"
-          echo "Release signing identity verified (non-secret metadata):"
-          echo "$RELEASE_KEYTOOL" | grep -E "Alias name:|Entry type:|Valid from:|SHA256:"
+          echo "Validating release keystore format, store password, alias 'upload', and key password..."
+          VK_PATH="$KEYSTORE_PATH" \
+          VK_STORE_PASS="$RESOLVED_STORE_PASS" \
+          VK_ALIAS="upload" \
+          VK_KEY_PASS="$RESOLVED_KEY_PASS" \
+            java "$RUNNER_TEMP/VerifyKeystore.java"
 
           export KEYSTORE_PATH
           export STORE_PASSWORD="$RESOLVED_STORE_PASS"
@@ -254,33 +514,64 @@ jobs:
 
           if [ -x ./gradlew ]; then
             ./gradlew assembleRelease --stacktrace
-          else
+          elif command -v gradle >/dev/null 2>&1; then
             gradle assembleRelease --stacktrace
+          else
+            echo "::error::Neither executable ./gradlew nor gradle CLI was found in PATH."
+            exit 1
           fi
 
           RELEASE_APK="app/build/outputs/apk/release/app-release.apk"
+          if [ ! -f "$RELEASE_APK" ] || [ ! -s "$RELEASE_APK" ]; then
+            echo "::error::Expected Release APK missing or empty at '$RELEASE_APK'."
+            ls -la app/build/outputs/apk/release 2>&1 || true
+            exit 1
+          fi
+
           STAGING_DIR="$RUNNER_TEMP/artifacts/release"
           mkdir -p "$STAGING_DIR"
 
-          test -f "$RELEASE_APK"
-          test -s "$RELEASE_APK"
-          unzip -t "$RELEASE_APK" >/dev/null
-          "$BUILD_TOOLS/zipalign" -c -P 16 4 "$RELEASE_APK"
-          APKSIGNER_OUT="$("$BUILD_TOOLS/apksigner" verify --verbose --min-sdk-version 26 --max-sdk-version 36 --print-certs "$RELEASE_APK")"
+          if ! UNZIP_OUT="$(unzip -t "$RELEASE_APK" 2>&1)"; then
+            echo "$UNZIP_OUT" >&2
+            echo "::error::unzip -t reported ZIP integrity errors in $RELEASE_APK."
+            exit 1
+          fi
+          if ! ZIPALIGN_OUT="$("$BUILD_TOOLS/zipalign" -c -P 16 4 "$RELEASE_APK" 2>&1)"; then
+            echo "$ZIPALIGN_OUT" >&2
+            echo "::error::zipalign -c -P 16 4 failed for $RELEASE_APK."
+            exit 1
+          fi
+          if ! APKSIGNER_OUT="$("$BUILD_TOOLS/apksigner" verify --verbose --min-sdk-version 26 --max-sdk-version 36 --print-certs "$RELEASE_APK" 2>&1)"; then
+            echo "$APKSIGNER_OUT" >&2
+            echo "::error::apksigner verification failed for $RELEASE_APK."
+            exit 1
+          fi
           echo "$APKSIGNER_OUT"
 
-          BADGING="$("$BUILD_TOOLS/aapt2" dump badging "$RELEASE_APK")"
-          echo "$BADGING" | head -n 12
+          if ! BADGING="$("$BUILD_TOOLS/aapt2" dump badging "$RELEASE_APK" 2>&1)"; then
+            echo "$BADGING" >&2
+            echo "::error::aapt2 dump badging failed for $RELEASE_APK."
+            exit 1
+          fi
+          sed -n '1,12p' <<< "$BADGING"
+
           ABI_LIST="$(unzip -l "$RELEASE_APK" | grep "lib/" || true)"
+          if [ -z "$ABI_LIST" ]; then
+            echo "::error::No native libraries found under lib/ inside $RELEASE_APK."
+            exit 1
+          fi
           echo "$ABI_LIST"
-          if echo "$ABI_LIST" | grep -qE "lib/(armeabi-v7a|x86)/"; then
+          if grep -qE "lib/(armeabi-v7a|x86)/" <<< "$ABI_LIST"; then
             echo "::error::Incomplete 32-bit ABI detected in release APK."
             exit 1
           fi
           for abi in arm64-v8a x86_64; do
-            echo "$ABI_LIST" | grep -q "lib/$abi/liblitertlm_jni.so"
-            echo "$ABI_LIST" | grep -q "lib/$abi/liblitert_jni.so"
-            echo "$ABI_LIST" | grep -q "lib/$abi/libmlkit_google_ocr_pipeline.so"
+            for lib in liblitertlm_jni.so liblitert_jni.so libmlkit_google_ocr_pipeline.so; do
+              if ! grep -q "lib/$abi/$lib" <<< "$ABI_LIST"; then
+                echo "::error::Missing required native library lib/$abi/$lib in $RELEASE_APK."
+                exit 1
+              fi
+            done
           done
 
           DELIVERABLE_APK="$STAGING_DIR/AI-Commander-release.apk"
@@ -293,10 +584,11 @@ jobs:
             echo "File: AI-Commander-release.apk"
             echo "Size: $APK_BYTES bytes"
             echo "SHA-256: $SHA256_SUM"
+            echo "ZIP Integrity (unzip -t): PASSED"
             echo "16 KB Page-Size Zipalign (-c -P 16 4): PASSED"
             echo ""
             echo "--- Badging Summary ---"
-            echo "$BADGING" | head -n 15
+            sed -n '1,15p' <<< "$BADGING"
             echo ""
             echo "--- Signature Verification (apksigner) ---"
             echo "$APKSIGNER_OUT"
