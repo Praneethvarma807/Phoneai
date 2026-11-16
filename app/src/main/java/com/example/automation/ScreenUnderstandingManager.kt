@@ -8,12 +8,13 @@ import com.example.ai.LocalLlmEngine
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
+import kotlin.coroutines.resume
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
-import kotlin.coroutines.resume
 
 data class ScreenAnalysisReport(
     val sourceUsed: String,
@@ -43,6 +44,9 @@ class ScreenUnderstandingManager(
 
     fun hasProjectionGrant(): Boolean = lastProjectionResultCode != null && lastProjectionData != null
 
+    fun canAnalyzeWithoutProjectionDialog(): Boolean =
+        hasProjectionGrant() || CommanderAccessibilityService.isConnected()
+
     suspend fun analyzeCurrentScreen(): Result<ScreenAnalysisReport> = withContext(Dispatchers.Default) {
         val accessibilitySnapshot = CommanderAccessibilityService.activeService.value?.captureScreenSnapshot()
 
@@ -52,6 +56,7 @@ class ScreenUnderstandingManager(
         var ocrText = ""
         var sourceLabel = ""
         var timedOut = false
+        var projectionFailed = false
 
         if (resultCode != null && resultData != null) {
             val deferred = CompletableDeferred<Bitmap?>()
@@ -64,16 +69,27 @@ class ScreenUnderstandingManager(
                 ContextCompat.startForegroundService(context, serviceIntent)
             }.isSuccess
 
-            val bitmap = if (started) {
-                withTimeoutOrNull(12_000L) {
-                    deferred.await()
+            val bitmap = try {
+                if (started) {
+                    withTimeoutOrNull(12_000L) {
+                        deferred.await()
+                    }
+                } else {
+                    projectionFailed = true
+                    null
                 }
-            } else {
-                null
+            } catch (ce: CancellationException) {
+                if (ScreenCaptureService.pendingCapture === deferred) {
+                    ScreenCaptureService.pendingCapture = null
+                }
+                throw ce
             }
 
             if (bitmap == null && started) {
                 timedOut = ScreenCaptureService.pendingCapture === deferred
+                if (!timedOut) {
+                    projectionFailed = true
+                }
                 if (ScreenCaptureService.pendingCapture === deferred) {
                     ScreenCaptureService.pendingCapture = null
                 }
@@ -84,9 +100,18 @@ class ScreenUnderstandingManager(
             lastProjectionData = null
 
             if (bitmap != null) {
-                ocrText = runMlKitOcr(bitmap)
-                bitmap.recycle()
-                sourceLabel = "MediaProjection + On-Device ML Kit OCR"
+                try {
+                    ocrText = runMlKitOcr(bitmap)
+                    sourceLabel = if (ocrText.isNotBlank()) {
+                        "MediaProjection + On-Device ML Kit OCR"
+                    } else {
+                        "MediaProjection Capture (No text recognized)"
+                    }
+                } finally {
+                    if (!bitmap.isRecycled) {
+                        bitmap.recycle()
+                    }
+                }
             }
         }
 
@@ -97,17 +122,20 @@ class ScreenUnderstandingManager(
                 appendLine(accessibilitySnapshot.combinedText)
                 if (sourceLabel.isBlank()) {
                     sourceLabel = "Accessibility Window Inspection"
-                } else {
+                } else if (!sourceLabel.contains("Accessibility")) {
                     sourceLabel += " + Accessibility Tree"
                 }
             }
         }.trim()
 
         if (combinedText.isBlank()) {
-            val msg = if (timedOut) {
-                "Screen capture timed out after 12 seconds. Grant Screen Capture permission again or enable Accessibility Service."
-            } else {
-                "No screen text captured. Grant Screen Capture permission or enable Accessibility Service."
+            val msg = when {
+                timedOut ->
+                    "Screen capture timed out after 12 seconds. Grant Screen Capture permission again or enable Accessibility Service."
+                projectionFailed ->
+                    "Screen capture session stopped or permission was revoked. Re-grant Screen Capture or enable Accessibility Service."
+                else ->
+                    "No readable text was found on screen. Grant Screen Capture permission or enable Accessibility Service."
             }
             return@withContext Result.failure(IllegalStateException(msg))
         }
@@ -126,7 +154,15 @@ class ScreenUnderstandingManager(
     }
 
     private suspend fun runMlKitOcr(bitmap: Bitmap): String = suspendCancellableCoroutine { cont ->
-        val image = InputImage.fromBitmap(bitmap, 0)
+        if (bitmap.isRecycled) {
+            if (cont.isActive) cont.resume("")
+            return@suspendCancellableCoroutine
+        }
+        val image = runCatching { InputImage.fromBitmap(bitmap, 0) }.getOrNull()
+        if (image == null) {
+            if (cont.isActive) cont.resume("")
+            return@suspendCancellableCoroutine
+        }
         textRecognizer.process(image)
             .addOnSuccessListener { visionText ->
                 if (cont.isActive) cont.resume(visionText.text.trim())

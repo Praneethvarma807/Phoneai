@@ -27,7 +27,8 @@ data class CommanderSettings(
     val speechLanguage: SpeechLanguageOption = SpeechLanguageOption.AUTO,
     val preferredBackend: String = "CPU",
     val commandOnlyMode: Boolean = false,
-    val kwsModelPath: String = ""
+    val kwsModelPath: String = "",
+    val requestedPermissions: Set<String> = emptySet()
 )
 
 class CommanderPreferences(private val context: Context) {
@@ -43,12 +44,25 @@ class CommanderPreferences(private val context: Context) {
         val PREFERRED_BACKEND = stringPreferencesKey("preferred_backend")
         val COMMAND_ONLY_MODE = booleanPreferencesKey("command_only_mode")
         val KWS_MODEL_PATH = stringPreferencesKey("kws_model_path")
+        val AUTHORIZED_DOCUMENTS_JSON = stringPreferencesKey("authorized_documents_json")
+        val REQUESTED_PERMISSIONS_JSON = stringPreferencesKey("requested_permissions_json")
+    }
+
+    val authorizedDocumentsJson: Flow<String> = context.commanderDataStore.data.map { prefs ->
+        prefs[Keys.AUTHORIZED_DOCUMENTS_JSON] ?: ""
+    }
+
+    val requestedPermissions: Flow<Set<String>> = context.commanderDataStore.data.map { prefs ->
+        val raw = prefs[Keys.REQUESTED_PERMISSIONS_JSON].orEmpty()
+        if (raw.isBlank()) emptySet() else raw.split("|").filter { it.isNotBlank() }.toSet()
     }
 
     val settings: Flow<CommanderSettings> = context.commanderDataStore.data.map { prefs ->
         val langCode = prefs[Keys.SPEECH_LANGUAGE] ?: SpeechLanguageOption.AUTO.code
         val langOption = SpeechLanguageOption.entries.firstOrNull { it.code == langCode }
             ?: SpeechLanguageOption.AUTO
+        val rawReqPerms = prefs[Keys.REQUESTED_PERMISSIONS_JSON].orEmpty()
+        val reqPerms = if (rawReqPerms.isBlank()) emptySet() else rawReqPerms.split("|").filter { it.isNotBlank() }.toSet()
         CommanderSettings(
             wakeWordEnabled = prefs[Keys.WAKE_WORD_ENABLED] ?: false,
             wakeWordSensitivity = prefs[Keys.WAKE_WORD_SENSITIVITY] ?: 0.65f,
@@ -60,7 +74,8 @@ class CommanderPreferences(private val context: Context) {
             speechLanguage = langOption,
             preferredBackend = prefs[Keys.PREFERRED_BACKEND] ?: "CPU",
             commandOnlyMode = prefs[Keys.COMMAND_ONLY_MODE] ?: false,
-            kwsModelPath = prefs[Keys.KWS_MODEL_PATH] ?: ""
+            kwsModelPath = prefs[Keys.KWS_MODEL_PATH] ?: "",
+            requestedPermissions = reqPerms
         )
     }
 
@@ -106,5 +121,21 @@ class CommanderPreferences(private val context: Context) {
 
     suspend fun setKwsModelPath(path: String) {
         context.commanderDataStore.edit { it[Keys.KWS_MODEL_PATH] = path }
+    }
+
+    suspend fun setAuthorizedDocumentsJson(json: String) {
+        context.commanderDataStore.edit { it[Keys.AUTHORIZED_DOCUMENTS_JSON] = json }
+    }
+
+    suspend fun markPermissionsRequested(permissions: Collection<String>) {
+        if (permissions.isEmpty()) return
+        context.commanderDataStore.edit { prefs ->
+            val current = prefs[Keys.REQUESTED_PERMISSIONS_JSON].orEmpty()
+                .split("|")
+                .filter { it.isNotBlank() }
+                .toMutableSet()
+            current.addAll(permissions)
+            prefs[Keys.REQUESTED_PERMISSIONS_JSON] = current.joinToString("|")
+        }
     }
 }

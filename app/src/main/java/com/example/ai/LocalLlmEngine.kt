@@ -64,8 +64,13 @@ class LocalLlmEngine(
     ): Result<Unit> = withContext(engineDispatcher) {
         mutex.withLock {
             val file = File(modelPath)
-            if (!file.exists() || !file.isFile) {
-                val msg = "Model file not found at $modelPath"
+            if (!file.exists() || !file.isFile || !file.canRead()) {
+                val msg = "Model file not found or unreadable at $modelPath"
+                _runtimeState.update { it.copy(isLoading = false, isReady = false, error = msg) }
+                return@withLock Result.failure(IllegalStateException(msg))
+            }
+            if (file.length() < MIN_VALID_MODEL_BYTES) {
+                val msg = "Model file is incomplete or corrupted (${file.length()} bytes). Re-download or import a valid .litertlm model."
                 _runtimeState.update { it.copy(isLoading = false, isReady = false, error = msg) }
                 return@withLock Result.failure(IllegalStateException(msg))
             }
@@ -85,12 +90,30 @@ class LocalLlmEngine(
                 )
             }
 
-            val firstBackend = if (preferGpu) Backend.GPU() else Backend.CPU()
+            val compat = DeviceCompatibilityManager(context)
+            if (!compat.isNativeLlmSupported()) {
+                val msg = "64-bit ABI (arm64-v8a / x86_64) required for native LiteRT-LM. Continuing with Deterministic Command Engine."
+                _runtimeState.update {
+                    it.copy(
+                        activeModelId = null,
+                        loadedModelName = null,
+                        backendUsed = "None",
+                        isLoading = false,
+                        isReady = false,
+                        commandOnlyMode = true,
+                        error = msg
+                    )
+                }
+                return@withLock Result.failure(UnsupportedOperationException(msg))
+            }
+
+            val allowGpu = preferGpu && compat.inspectDevice().supportsGpuAcceleration
+            val firstBackend = if (allowGpu) Backend.GPU() else Backend.CPU()
             val systemInstruction = buildSystemPrompt(toolSchemas)
 
             val loaded = tryInitialize(modelPath, firstBackend, systemInstruction)
-            val finalResult = if (loaded.isFailure && preferGpu) {
-                tryInitialize(modelPath, Backend.CPU(), systemInstruction)
+            val finalResult = if (loaded.isFailure && allowGpu) {
+                tryInitialize(modelPath, Backend.CPU(), systemInstruction).map { "CPU (GPU fallback)" }
             } else {
                 loaded
             }
@@ -112,6 +135,10 @@ class LocalLlmEngine(
                 },
                 onFailure = { err ->
                     releaseInternal()
+                    val friendly = when (err) {
+                        is UnsatisfiedLinkError -> "Native LiteRT-LM runtime is unavailable on this CPU architecture (${err.message})."
+                        else -> err.message ?: "Failed to initialize LiteRT-LM model"
+                    }
                     _runtimeState.update {
                         it.copy(
                             activeModelId = null,
@@ -119,7 +146,7 @@ class LocalLlmEngine(
                             backendUsed = "None",
                             isLoading = false,
                             isReady = false,
-                            error = err.message ?: "Failed to initialize LiteRT-LM model"
+                            error = friendly
                         )
                     }
                     Result.failure(err)
@@ -132,7 +159,7 @@ class LocalLlmEngine(
         modelPath: String,
         backend: Backend,
         systemInstruction: String
-    ): Result<String> = runCatching {
+    ): Result<String> = try {
         val config = EngineConfig(
             modelPath = modelPath,
             backend = backend,
@@ -147,7 +174,16 @@ class LocalLlmEngine(
                 samplerConfig = SamplerConfig(topK = 16, topP = 0.9, temperature = 0.2)
             )
         )
-        if (backend is Backend.GPU) "GPU" else "CPU"
+        Result.success(if (backend is Backend.GPU) "GPU" else "CPU")
+    } catch (t: Throwable) {
+        if (t is Error && t !is UnsatisfiedLinkError && t !is NoClassDefFoundError) {
+            throw t
+        }
+        runCatching { conversation?.close() }
+        conversation = null
+        runCatching { engine?.close() }
+        engine = null
+        Result.failure(t)
     }
 
     suspend fun planCommand(
@@ -285,6 +321,7 @@ class LocalLlmEngine(
 
     companion object {
         private const val INFERENCE_TIMEOUT_MS = 45_000L
+        private const val MIN_VALID_MODEL_BYTES = 1_000_000L
     }
 }
 

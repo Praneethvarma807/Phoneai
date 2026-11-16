@@ -28,6 +28,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.Response
 
 data class DownloadProgressState(
     val modelId: String,
@@ -43,18 +44,11 @@ data class DownloadProgressState(
 class ModelDownloadManager(
     private val context: Context,
     private val dao: DownloadedModelDao,
-    private val compatibilityManager: DeviceCompatibilityManager
+    private val compatibilityManager: DeviceCompatibilityManager,
+    private val client: OkHttpClient = defaultClient()
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val activeJobs = ConcurrentHashMap<String, Job>()
-
-    private val client = OkHttpClient.Builder()
-        .connectTimeout(30, TimeUnit.SECONDS)
-        .readTimeout(60, TimeUnit.SECONDS)
-        .writeTimeout(60, TimeUnit.SECONDS)
-        .followRedirects(true)
-        .followSslRedirects(true)
-        .build()
 
     private val _progress = MutableStateFlow<Map<String, DownloadProgressState>>(emptyMap())
     val progress: StateFlow<Map<String, DownloadProgressState>> = _progress.asStateFlow()
@@ -82,22 +76,43 @@ class ModelDownloadManager(
 
         val job = scope.launch {
             val partFile = File(modelsDir(), "${spec.fileName}.part")
+            val checksumSidecar = File(modelsDir(), "${spec.fileName}.sha256")
             val finalFile = File(modelsDir(), spec.fileName)
             try {
-                if (finalFile.exists() && finalFile.length() > 10_000_000L) {
-                    markReady(spec, finalFile)
-                    return@launch
+                if (finalFile.exists() && finalFile.length() >= MIN_MODEL_BYTES) {
+                    val savedExpectedSha = spec.expectedSha256 ?: checksumSidecar.takeIf { it.exists() }?.readText()?.trim()
+                    if (validateDownloadedFile(finalFile, spec, savedExpectedSha)) {
+                        markReady(spec, finalFile)
+                        return@launch
+                    } else {
+                        finalFile.delete()
+                    }
                 }
+
+                var expectedRemoteSize = -1L
+                var serverSha256: String? = spec.expectedSha256
+                    ?: checksumSidecar.takeIf { it.exists() }?.readText()?.trim()?.takeIf { isValidSha256Hex(it) }
 
                 var attempt = 0
                 var lastError: Exception? = null
                 while (attempt < MAX_RETRIES) {
                     try {
-                        downloadOnce(spec, partFile, finalFile)
+                        val outcome = downloadOnce(spec, partFile, finalFile)
+                        if (outcome.expectedTotalBytes > 0L) {
+                            expectedRemoteSize = outcome.expectedTotalBytes
+                        }
+                        if (!outcome.serverSha256.isNullOrBlank()) {
+                            serverSha256 = outcome.serverSha256
+                            checksumSidecar.writeText(outcome.serverSha256)
+                        }
                         lastError = null
                         break
                     } catch (e: CancellationException) {
                         throw e
+                    } catch (e: RangeMismatchException) {
+                        partFile.delete()
+                        checksumSidecar.delete()
+                        attempt++
                     } catch (e: IOException) {
                         lastError = e
                         attempt++
@@ -116,15 +131,24 @@ class ModelDownloadManager(
                 }
                 if (lastError != null) throw lastError
 
-                if (!validateDownloadedFile(partFile, spec)) {
+                if (expectedRemoteSize > 0L && partFile.length() != expectedRemoteSize) {
                     partFile.delete()
-                    throw IllegalStateException("Downloaded file failed validation check.")
+                    throw IllegalStateException(
+                        "Incomplete download (${partFile.length()} of $expectedRemoteSize bytes). Retry to resume."
+                    )
                 }
+
+                if (!validateDownloadedFile(partFile, spec, serverSha256)) {
+                    partFile.delete()
+                    throw IllegalStateException("Downloaded model failed integrity or checksum verification.")
+                }
+
                 if (finalFile.exists()) finalFile.delete()
                 if (!partFile.renameTo(finalFile)) {
                     partFile.copyTo(finalFile, overwrite = true)
                     partFile.delete()
                 }
+                checksumSidecar.delete()
                 markReady(spec, finalFile)
             } catch (_: CancellationException) {
                 val bytes = if (partFile.exists()) partFile.length() else 0L
@@ -162,7 +186,11 @@ class ModelDownloadManager(
         activeJobs[spec.id] = job
     }
 
-    private suspend fun downloadOnce(spec: LocalModelSpec, partFile: File, finalFile: File) {
+    private suspend fun downloadOnce(
+        spec: LocalModelSpec,
+        partFile: File,
+        finalFile: File
+    ): DownloadOutcome {
         val existingBytes = if (partFile.exists()) partFile.length() else 0L
         val requestBuilder = Request.Builder().url(spec.downloadUrl)
         if (existingBytes > 0L) {
@@ -183,14 +211,31 @@ class ModelDownloadManager(
         )
 
         client.newCall(requestBuilder.build()).execute().use { response ->
-            if (!response.isSuccessful && response.code != 206) {
-                throw IllegalStateException("HTTP ${response.code}: ${response.message}. Public download unavailable.")
+            if (response.code == 416) {
+                throw RangeMismatchException("Server rejected partial range offset $existingBytes")
             }
+            if (!response.isSuccessful && response.code != 206) {
+                val reason = when (response.code) {
+                    401, 403 -> "HTTP ${response.code} (Access restricted or license confirmation required). Download the .litertlm file manually and use Import Local Model."
+                    404 -> "HTTP 404 (Model file URL not found on host)."
+                    429 -> "HTTP 429 (Rate limited by host). Please retry in a few moments."
+                    else -> "HTTP ${response.code}: ${response.message}."
+                }
+                throw IllegalStateException(reason)
+            }
+
+            val contentType = response.header("Content-Type").orEmpty().lowercase()
+            if (contentType.contains("text/html") || contentType.contains("application/json")) {
+                throw IllegalStateException("Host returned $contentType instead of a binary .litertlm model. Use Import Local Model.")
+            }
+
             val body = response.body ?: throw IllegalStateException("Empty response body")
             val append = response.code == 206 && existingBytes > 0L
             val startOffset = if (append) existingBytes else 0L
             val contentLen = body.contentLength()
-            val totalSize = if (contentLen > 0L) startOffset + contentLen else spec.expectedSizeBytes
+            val expectedTotal = resolveExpectedTotalBytes(response, startOffset, contentLen)
+            val progressDenominator = if (expectedTotal > 0L) expectedTotal else spec.expectedSizeBytes
+            val serverSha256 = extractSha256Header(response)
 
             body.byteStream().use { input ->
                 FileOutputStream(partFile, append).use { output ->
@@ -205,12 +250,13 @@ class ModelDownloadManager(
                         val now = System.currentTimeMillis()
                         if (now - lastEmit > 250L) {
                             lastEmit = now
-                            updateProgress(spec.id, downloaded, totalSize, ModelInstallStatus.DOWNLOADING)
+                            updateProgress(spec.id, downloaded, progressDenominator, ModelInstallStatus.DOWNLOADING)
                         }
                     }
                     output.flush()
                 }
             }
+            return DownloadOutcome(expectedTotalBytes = expectedTotal, serverSha256 = serverSha256)
         }
     }
 
@@ -229,7 +275,7 @@ class ModelDownloadManager(
                     }
                 } ?: throw IllegalStateException("Cannot open selected model file.")
 
-                if (dest.length() < 1_000_000L) {
+                if (dest.length() < MIN_MODEL_BYTES) {
                     dest.delete()
                     throw IllegalStateException("Selected file is too small to be a valid .litertlm model.")
                 }
@@ -256,12 +302,12 @@ class ModelDownloadManager(
         runCatching {
             val entity = dao.getById(modelId) ?: throw IllegalStateException("Model not found")
             val file = File(entity.localPath)
-            if (!file.exists() || file.length() < 1_000_000L) {
+            if (!file.exists() || file.name.endsWith(".part") || file.length() < MIN_MODEL_BYTES) {
                 dao.upsert(entity.copy(status = ModelInstallStatus.CORRUPTED.name))
-                throw IllegalStateException("Model file missing or truncated.")
+                throw IllegalStateException("Model file missing, partial, or truncated.")
             }
             val sha = computeSha256(file)
-            if (!entity.sha256Checksum.isNullOrBlank() && entity.sha256Checksum != sha) {
+            if (!entity.sha256Checksum.isNullOrBlank() && !entity.sha256Checksum.equals(sha, ignoreCase = true)) {
                 dao.upsert(entity.copy(status = ModelInstallStatus.CORRUPTED.name))
                 throw IllegalStateException("Checksum mismatch.")
             }
@@ -276,6 +322,7 @@ class ModelDownloadManager(
         if (entity != null) {
             File(entity.localPath).delete()
             File(modelsDir(), "${entity.fileName}.part").delete()
+            File(modelsDir(), "${entity.fileName}.sha256").delete()
         }
         dao.deleteById(modelId)
         _progress.update { it - modelId }
@@ -298,7 +345,7 @@ class ModelDownloadManager(
                 displayName = spec.displayName,
                 fileName = spec.fileName,
                 localPath = file.absolutePath,
-                expectedSizeBytes = spec.expectedSizeBytes,
+                expectedSizeBytes = file.length(),
                 downloadedBytes = file.length(),
                 sha256Checksum = sha,
                 status = ModelInstallStatus.READY.name
@@ -307,11 +354,16 @@ class ModelDownloadManager(
         updateProgress(spec.id, file.length(), file.length(), ModelInstallStatus.READY)
     }
 
-    private fun validateDownloadedFile(file: File, spec: LocalModelSpec): Boolean {
-        if (!file.exists() || file.length() < 1_000_000L) return false
-        if (!spec.expectedSha256.isNullOrBlank()) {
+    internal fun validateDownloadedFile(
+        file: File,
+        spec: LocalModelSpec,
+        expectedSha256: String? = spec.expectedSha256
+    ): Boolean {
+        if (!file.exists() || file.length() < MIN_MODEL_BYTES) return false
+        val shaTarget = expectedSha256?.takeIf { isValidSha256Hex(it) }
+        if (shaTarget != null) {
             val actual = computeSha256(file)
-            if (!actual.equals(spec.expectedSha256, ignoreCase = true)) return false
+            if (!actual.equals(shaTarget, ignoreCase = true)) return false
         }
         return true
     }
@@ -341,7 +393,56 @@ class ModelDownloadManager(
         }
     }
 
+    private data class DownloadOutcome(
+        val expectedTotalBytes: Long,
+        val serverSha256: String?
+    )
+
+    private class RangeMismatchException(message: String) : IOException(message)
+
     companion object {
         private const val MAX_RETRIES = 3
+        internal const val MIN_MODEL_BYTES = 1_000_000L
+
+        private fun defaultClient(): OkHttpClient = OkHttpClient.Builder()
+            .connectTimeout(30, TimeUnit.SECONDS)
+            .readTimeout(60, TimeUnit.SECONDS)
+            .writeTimeout(60, TimeUnit.SECONDS)
+            .followRedirects(true)
+            .followSslRedirects(true)
+            .build()
+
+        internal fun isValidSha256Hex(value: String): Boolean {
+            val clean = value.trim().removePrefix("\"").removeSuffix("\"")
+            return clean.length == 64 && clean.all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' }
+        }
+
+        internal fun extractSha256Header(response: Response): String? {
+            val candidates = listOfNotNull(
+                response.header("X-Linked-ETag"),
+                response.header("ETag")
+            )
+            for (raw in candidates) {
+                val clean = raw.trim().removePrefix("W/").removeSurrounding("\"")
+                if (isValidSha256Hex(clean)) return clean.lowercase()
+            }
+            return null
+        }
+
+        internal fun resolveExpectedTotalBytes(
+            response: Response,
+            startOffset: Long,
+            contentLength: Long
+        ): Long {
+            val contentRange = response.header("Content-Range")
+            if (!contentRange.isNullOrBlank()) {
+                val slashIdx = contentRange.lastIndexOf('/')
+                if (slashIdx != -1) {
+                    val total = contentRange.substring(slashIdx + 1).trim().toLongOrNull()
+                    if (total != null && total > 0L) return total
+                }
+            }
+            return if (contentLength > 0L) startOffset + contentLength else -1L
+        }
     }
 }

@@ -21,11 +21,11 @@ class DeviceCompatibilityManager(private val context: Context) {
         val statFs = StatFs(context.filesDir.absolutePath)
         val availableStorageMb = (statFs.availableBlocksLong * statFs.blockSizeLong) / (1024L * 1024L)
 
-        val abis = Build.SUPPORTED_ABIS
+        val abis = Build.SUPPORTED_ABIS ?: emptyArray()
         val primaryAbi = abis.firstOrNull() ?: "unknown"
         val isArm64 = abis.any { it.contains("arm64") }
 
-        val supportsGpu = detectOpenClOrGpu()
+        val supportsGpu = detectOpenClOrGpu(isArm64 = isArm64, totalRamMb = totalRamMb)
 
         val tier = when {
             totalRamMb < 4096L -> DeviceTier.LOW_RAM
@@ -44,15 +44,20 @@ class DeviceCompatibilityManager(private val context: Context) {
         )
     }
 
+    fun isNativeLlmSupported(): Boolean {
+        val abis = Build.SUPPORTED_ABIS ?: return false
+        return abis.any { it == "arm64-v8a" || it == "x86_64" }
+    }
+
     fun checkModelCompatibility(
         minRamMb: Long,
         minStorageMb: Long
     ): CompatibilityCheckResult {
         val info = inspectDevice()
-        if (!info.isArm64 && !info.cpuAbi.contains("x86_64")) {
+        if (!info.isArm64 && !isNativeLlmSupported()) {
             return CompatibilityCheckResult(
                 isCompatible = false,
-                reason = "64-bit CPU (arm64-v8a) is required for LiteRT-LM local LLM inference. Detected: ${info.cpuAbi}."
+                reason = "64-bit CPU (arm64-v8a or x86_64) is required for LiteRT-LM local LLM inference. Detected: ${info.cpuAbi}."
             )
         }
         if (info.totalRamMb < minRamMb) {
@@ -73,14 +78,34 @@ class DeviceCompatibilityManager(private val context: Context) {
         )
     }
 
-    private fun detectOpenClOrGpu(): Boolean {
+    internal fun isEmulator(): Boolean {
+        val fingerprint = Build.FINGERPRINT.lowercase()
+        val model = Build.MODEL.lowercase()
+        val manufacturer = Build.MANUFACTURER.lowercase()
+        val hardware = Build.HARDWARE.lowercase()
+        val product = Build.PRODUCT.lowercase()
+        return fingerprint.contains("generic") ||
+            fingerprint.contains("emulator") ||
+            model.contains("emulator") ||
+            model.contains("android sdk built for") ||
+            manufacturer.contains("genymotion") ||
+            hardware.contains("goldfish") ||
+            hardware.contains("ranchu") ||
+            product.contains("sdk") ||
+            product.contains("vbox")
+    }
+
+    private fun detectOpenClOrGpu(isArm64: Boolean, totalRamMb: Long): Boolean {
+        if (!isArm64 || totalRamMb < 4096L || isEmulator()) return false
         val candidates = listOf(
             "/system/vendor/lib64/libOpenCL.so",
             "/system/lib64/libOpenCL.so",
-            "/vendor/lib64/libOpenCL.so",
-            "/vendor/lib64/egl/libGLES_mali.so"
+            "/vendor/lib64/libOpenCL.so"
         )
-        return candidates.any { File(it).exists() }
+        return candidates.any { path ->
+            val file = File(path)
+            file.exists() && file.canRead()
+        }
     }
 }
 

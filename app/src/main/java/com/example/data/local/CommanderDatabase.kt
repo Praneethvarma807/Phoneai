@@ -108,8 +108,20 @@ interface LocalReminderDao {
     @Query("SELECT * FROM local_reminders ORDER BY triggerAtMillis ASC")
     fun observeAll(): Flow<List<LocalReminderEntity>>
 
+    @Query("SELECT * FROM local_reminders WHERE id = :id LIMIT 1")
+    suspend fun getById(id: Long): LocalReminderEntity?
+
+    @Query("SELECT * FROM local_reminders WHERE isCompleted = 0 ORDER BY triggerAtMillis ASC")
+    suspend fun getPendingOnce(): List<LocalReminderEntity>
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insert(reminder: LocalReminderEntity): Long
+
+    @androidx.room.Update
+    suspend fun updateReminder(reminder: LocalReminderEntity)
+
+    @Query("UPDATE local_reminders SET title = :title, triggerAtMillis = :triggerAtMillis, notes = :notes WHERE id = :id")
+    suspend fun updateReminder(id: Long, title: String, triggerAtMillis: Long, notes: String)
 
     @Query("UPDATE local_reminders SET isCompleted = :completed WHERE id = :id")
     suspend fun setCompleted(id: Long, completed: Boolean)

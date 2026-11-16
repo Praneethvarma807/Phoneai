@@ -37,6 +37,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.Message
 import androidx.compose.material.icons.filled.Apps
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
@@ -44,7 +45,6 @@ import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.Event
 import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.Language
-import androidx.compose.material.icons.filled.Message
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Psychology
 import androidx.compose.material.icons.filled.Search
@@ -395,7 +395,7 @@ fun categoryIcon(category: ActionCategory) = when (category) {
     ActionCategory.SETTINGS -> Icons.Default.Settings
     ActionCategory.CALENDAR -> Icons.Default.Event
     ActionCategory.DOCUMENT -> Icons.Default.Description
-    ActionCategory.MESSAGING -> Icons.Default.Message
+    ActionCategory.MESSAGING -> Icons.AutoMirrored.Filled.Message
     ActionCategory.VISION -> Icons.Default.Visibility
     ActionCategory.APP_LAUNCH -> Icons.Default.Apps
     ActionCategory.SYSTEM -> Icons.Default.Psychology

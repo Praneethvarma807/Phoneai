@@ -127,7 +127,7 @@ fun CommanderAppShell(
         val observer = LifecycleEventObserver { _, event ->
             when (event) {
                 Lifecycle.Event.ON_STOP -> viewModel.onAppBackgrounded()
-                Lifecycle.Event.ON_RESUME -> viewModel.refreshSpeechCapabilities()
+                Lifecycle.Event.ON_RESUME -> viewModel.onAppResumed()
                 else -> Unit
             }
         }
@@ -153,6 +153,14 @@ fun CommanderAppShell(
     val requestScreenCapture: () -> Unit = {
         val mpm = context.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         screenCaptureLauncher.launch(mpm.createScreenCaptureIntent())
+    }
+
+    val triggerExplainScreen: () -> Unit = {
+        if (viewModel.canExplainScreenWithoutDialog()) {
+            viewModel.submitCommand("Explain my screen")
+        } else {
+            requestScreenCapture()
+        }
     }
 
     val navItems = remember {
@@ -268,7 +276,7 @@ fun CommanderAppShell(
                         composable<DashboardRoute> {
                             DashboardScreen(
                                 viewModel = viewModel,
-                                onRequestScreenCapture = requestScreenCapture,
+                                onRequestScreenCapture = triggerExplainScreen,
                                 onNavigateToModels = { navigateTab(ModelsRoute) },
                                 onNavigateToSettings = { navigateTab(SettingsRoute) }
                             )
@@ -279,7 +287,7 @@ fun CommanderAppShell(
                         composable<ToolsRoute> {
                             ToolsScreen(
                                 viewModel = viewModel,
-                                onRequestScreenCapture = requestScreenCapture
+                                onRequestScreenCapture = triggerExplainScreen
                             )
                         }
                         composable<HistoryRoute> {

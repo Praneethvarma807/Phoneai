@@ -1,4 +1,4 @@
-name: Android Debug APK Build
+name: Android APK Build & Verification
 
 on:
   push:
@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-debug-apk:
+  build-and-verify-apk:
     runs-on: ubuntu-latest
 
     steps:
@@ -41,9 +41,7 @@ jobs:
         with:
           gradle-version: '9.3.1'
 
-      # Optional: configure these repository secrets once to keep APK signing stable
-      # across workflow runs: DEBUG_KEYSTORE_BASE64, DEBUG_STORE_PASSWORD,
-      # DEBUG_KEY_ALIAS, and DEBUG_KEY_PASSWORD.
+      # Optional: configure DEBUG_KEYSTORE_* secrets once to keep debug APK signing stable across CI runs.
       - name: Configure persistent debug signing (optional)
         env:
           DEBUG_KEYSTORE_BASE64: ${{ secrets.DEBUG_KEYSTORE_BASE64 }}
@@ -65,24 +63,24 @@ jobs:
             echo "::notice::No persistent debug keystore secret configured; Gradle will use its standard debug signing."
           fi
 
-      - name: Run unit tests and build Debug APK
+      - name: Run unit tests, Lint, and build Debug APK
         run: |
           if [ -x ./gradlew ]; then
-            ./gradlew clean
-            ./gradlew testDebugUnitTest assembleDebug --stacktrace
+            ./gradlew clean testDebugUnitTest lintDebug assembleDebug --stacktrace
           else
-            gradle clean
-            gradle testDebugUnitTest assembleDebug --stacktrace
+            gradle clean testDebugUnitTest lintDebug assembleDebug --stacktrace
           fi
 
-      - name: Verify Debug APK exists and signature is valid
+      - name: Verify Debug APK signature, package metadata, and SHA-256
         run: |
           SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
           APK="app/build/outputs/apk/debug/app-debug.apk"
           test -f "$APK"
           test -s "$APK"
           ls -lh "$APK"
-          "$SDK_ROOT/build-tools/36.0.0/apksigner" verify --verbose "$APK"
+          "$SDK_ROOT/build-tools/36.0.0/apksigner" verify --verbose --print-certs "$APK"
+          "$SDK_ROOT/build-tools/36.0.0/aapt2" dump badging "$APK" | head -n 5
+          sha256sum "$APK"
 
       - name: Upload Debug APK artifact
         uses: actions/upload-artifact@v4
@@ -90,3 +88,34 @@ jobs:
           name: ai-phone-commander-debug-apk
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
+
+      # Optional: builds minified R8 Release APK when persistent upload keystore secrets are configured.
+      - name: Build and verify signed Release APK (optional)
+        if: ${{ secrets.RELEASE_KEYSTORE_BASE64 != '' }}
+        env:
+          RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          KEYSTORE_PATH="$RUNNER_TEMP/phoneai-release.jks"
+          printf '%s' "$RELEASE_KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE_PATH"
+          export KEYSTORE_PATH
+          if [ -x ./gradlew ]; then
+            ./gradlew assembleRelease --stacktrace
+          else
+            gradle assembleRelease --stacktrace
+          fi
+          RELEASE_APK="app/build/outputs/apk/release/app-release.apk"
+          test -f "$RELEASE_APK"
+          ls -lh "$RELEASE_APK"
+          "$SDK_ROOT/build-tools/36.0.0/apksigner" verify --verbose --print-certs "$RELEASE_APK"
+          sha256sum "$RELEASE_APK"
+
+      - name: Upload Release APK artifact (optional)
+        if: ${{ secrets.RELEASE_KEYSTORE_BASE64 != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-phone-commander-release-apk
+          path: app/build/outputs/apk/release/app-release.apk
+          if-no-files-found: warn

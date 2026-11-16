@@ -1,9 +1,10 @@
 package com.example.ui.screens
 
 import android.Manifest
-import android.content.pm.PackageManager
+import android.app.Activity
+import android.content.Context
+import android.content.ContextWrapper
 import android.os.Build
-import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
@@ -47,9 +48,8 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import androidx.core.content.ContextCompat
+import androidx.core.app.ActivityCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import com.example.automation.CommanderAccessibilityService
 import com.example.domain.model.SpeechLanguageOption
 import com.example.ui.CommanderViewModel
 import com.example.ui.components.GlassCard
@@ -66,26 +66,20 @@ fun SettingsScreen(
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
+    val activity = remember(context) { context.findActivity() }
     val settings by viewModel.settings.collectAsStateWithLifecycle()
+    val permStatus by viewModel.permissionStatus.collectAsStateWithLifecycle()
     val wakeRunning by viewModel.wakeWordServiceRunning.collectAsStateWithLifecycle()
     val voiceState by viewModel.voiceListeningState.collectAsStateWithLifecycle()
     val ttsVoices by viewModel.ttsVoices.collectAsStateWithLifecycle()
     val execState by viewModel.executionState.collectAsStateWithLifecycle()
-    val accessibilityActive by CommanderAccessibilityService.activeService.collectAsStateWithLifecycle()
 
     var voiceMenuExpanded by remember { mutableStateOf(false) }
-
-    val micGranted = ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
-    val notifGranted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-        ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
-    } else true
-    val contactsGranted = ContextCompat.checkSelfPermission(context, Manifest.permission.READ_CONTACTS) == PackageManager.PERMISSION_GRANTED
-    val calendarGranted = ContextCompat.checkSelfPermission(context, Manifest.permission.WRITE_CALENDAR) == PackageManager.PERMISSION_GRANTED
-    val writeSettingsGranted = Settings.System.canWrite(context)
 
     val wakeMicLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestMultiplePermissions()
     ) { grants ->
+        viewModel.markPermissionsRequested(grants.keys.toList())
         if (grants[Manifest.permission.RECORD_AUDIO] == true) {
             viewModel.toggleWakeWord(true)
         }
@@ -93,12 +87,23 @@ fun SettingsScreen(
 
     val permLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestMultiplePermissions()
-    ) { }
+    ) { grants ->
+        viewModel.markPermissionsRequested(grants.keys.toList())
+    }
 
     val kwsPickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
     ) { uri ->
         if (uri != null) viewModel.importKwsModel(uri)
+    }
+
+    fun isPermanentlyDenied(permission: String, granted: Boolean): Boolean {
+        if (granted) return false
+        val wasRequested = permission in permStatus.requestedPermissions
+        val canAskAgain = activity?.let {
+            ActivityCompat.shouldShowRequestPermissionRationale(it, permission)
+        } ?: true
+        return wasRequested && !canAskAgain
     }
 
     Box(modifier = modifier.fillMaxSize(), contentAlignment = Alignment.TopCenter) {
@@ -140,8 +145,8 @@ fun SettingsScreen(
                             onCheckedChange = { enable ->
                                 if (enable) {
                                     val needed = buildList {
-                                        if (!micGranted) add(Manifest.permission.RECORD_AUDIO)
-                                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && !notifGranted) {
+                                        if (!permStatus.microphoneGranted) add(Manifest.permission.RECORD_AUDIO)
+                                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && !permStatus.notificationsGranted) {
                                             add(Manifest.permission.POST_NOTIFICATIONS)
                                         }
                                     }
@@ -166,8 +171,8 @@ fun SettingsScreen(
                             icon = Icons.Default.Hearing
                         )
                         StatusPill(
-                            label = if (micGranted) "Mic Granted" else "Mic Needed",
-                            color = if (micGranted) EmeraldSuccess else AmberWarning,
+                            label = if (permStatus.microphoneGranted) "Mic Granted" else "Mic Needed",
+                            color = if (permStatus.microphoneGranted) EmeraldSuccess else AmberWarning,
                             icon = Icons.Default.Mic
                         )
                     }
@@ -218,7 +223,7 @@ fun SettingsScreen(
                     }
                     Spacer(Modifier.height(6.dp))
                     Text(
-                        text = "Battery & Background Note: Wake word listening runs in an explicit foreground service with a persistent notification. Audio stays in RAM and is never recorded to disk or uploaded. OEM battery savers may restrict background mic capture when force-stopped or after reboot.",
+                        text = "Battery & Background Note: Wake word listening runs in an explicit foreground service with a persistent notification. Audio stays in RAM and is never recorded to disk or uploaded.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -376,34 +381,87 @@ fun SettingsScreen(
                 }
             }
 
-            // Permission Center
+            // Permission Center (Reactive StateFlow + Permanent Denial Recovery + Exact Alarm)
             item {
                 GlassCard {
-                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Icon(Icons.Default.Security, contentDescription = null, tint = ElectricCyan)
-                        Text("Permission & Security Center", style = MaterialTheme.typography.titleMedium)
-                    }
-                    Spacer(Modifier.height(8.dp))
-                    PermissionRow("Microphone", micGranted) {
-                        permLauncher.launch(arrayOf(Manifest.permission.RECORD_AUDIO))
-                    }
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                        PermissionRow("Notifications", notifGranted) {
-                            permLauncher.launch(arrayOf(Manifest.permission.POST_NOTIFICATIONS))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Icon(Icons.Default.Security, contentDescription = null, tint = ElectricCyan)
+                            Text("Permission & Security Center", style = MaterialTheme.typography.titleMedium)
+                        }
+                        OutlinedButton(
+                            onClick = { viewModel.refreshPermissions() },
+                            modifier = Modifier.testTag("refresh_permissions_button")
+                        ) {
+                            Text("Refresh")
                         }
                     }
-                    PermissionRow("Accessibility Automation", accessibilityActive != null) {
+                    Spacer(Modifier.height(8.dp))
+
+                    val micPermDenied = isPermanentlyDenied(Manifest.permission.RECORD_AUDIO, permStatus.microphoneGranted)
+                    PermissionRow(
+                        title = "Microphone",
+                        granted = permStatus.microphoneGranted,
+                        permanentlyDenied = micPermDenied
+                    ) {
+                        if (micPermDenied) viewModel.openAppSettings()
+                        else permLauncher.launch(arrayOf(Manifest.permission.RECORD_AUDIO))
+                    }
+
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        val notifPermDenied = isPermanentlyDenied(Manifest.permission.POST_NOTIFICATIONS, permStatus.notificationsGranted)
+                        PermissionRow(
+                            title = "Notifications",
+                            granted = permStatus.notificationsGranted,
+                            permanentlyDenied = notifPermDenied
+                        ) {
+                            if (notifPermDenied) viewModel.openAppSettings()
+                            else permLauncher.launch(arrayOf(Manifest.permission.POST_NOTIFICATIONS))
+                        }
+                    }
+
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                        PermissionRow(
+                            title = "Exact Reminder Alarms",
+                            granted = permStatus.exactAlarmGranted,
+                            permanentlyDenied = false,
+                            actionLabel = if (permStatus.exactAlarmGranted) "Review" else "Allow"
+                        ) {
+                            viewModel.openExactAlarmSettings()
+                        }
+                    }
+
+                    PermissionRow("Accessibility Automation", permStatus.accessibilityEnabled) {
                         viewModel.openAccessibilitySettings()
                     }
-                    PermissionRow("Modify Brightness (Write Settings)", writeSettingsGranted) {
+                    PermissionRow("Modify Brightness (Write Settings)", permStatus.writeSettingsGranted) {
                         viewModel.openWriteSettings()
                     }
-                    PermissionRow("Contacts (Drafting & Lookup)", contactsGranted) {
-                        permLauncher.launch(arrayOf(Manifest.permission.READ_CONTACTS))
+
+                    val contactsPermDenied = isPermanentlyDenied(Manifest.permission.READ_CONTACTS, permStatus.contactsGranted)
+                    PermissionRow(
+                        title = "Contacts (Drafting & Lookup)",
+                        granted = permStatus.contactsGranted,
+                        permanentlyDenied = contactsPermDenied
+                    ) {
+                        if (contactsPermDenied) viewModel.openAppSettings()
+                        else permLauncher.launch(arrayOf(Manifest.permission.READ_CONTACTS))
                     }
-                    PermissionRow("Calendar Events", calendarGranted) {
-                        permLauncher.launch(arrayOf(Manifest.permission.READ_CALENDAR, Manifest.permission.WRITE_CALENDAR))
+
+                    val calendarPermDenied = isPermanentlyDenied(Manifest.permission.WRITE_CALENDAR, permStatus.calendarGranted)
+                    PermissionRow(
+                        title = "Calendar Events",
+                        granted = permStatus.calendarGranted,
+                        permanentlyDenied = calendarPermDenied
+                    ) {
+                        if (calendarPermDenied) viewModel.openAppSettings()
+                        else permLauncher.launch(arrayOf(Manifest.permission.READ_CALENDAR, Manifest.permission.WRITE_CALENDAR))
                     }
+
                     Spacer(Modifier.height(6.dp))
                     Button(onClick = onRequestScreenCapture, modifier = Modifier.fillMaxWidth()) {
                         Text("Trigger Local Screen Capture Consent")
@@ -433,6 +491,12 @@ fun SettingsScreen(
     }
 }
 
+private tailrec fun Context.findActivity(): Activity? = when (this) {
+    is Activity -> this
+    is ContextWrapper -> baseContext.findActivity()
+    else -> null
+}
+
 @Composable
 private fun SettingSwitchRow(
     title: String,
@@ -457,6 +521,8 @@ private fun SettingSwitchRow(
 private fun PermissionRow(
     title: String,
     granted: Boolean,
+    permanentlyDenied: Boolean = false,
+    actionLabel: String? = null,
     onAction: () -> Unit
 ) {
     Row(
@@ -467,13 +533,23 @@ private fun PermissionRow(
         Column(modifier = Modifier.weight(1f)) {
             Text(title, style = MaterialTheme.typography.bodyMedium)
             Text(
-                text = if (granted) "Granted" else "Not granted",
+                text = when {
+                    granted -> "Granted"
+                    permanentlyDenied -> "Denied (Enable in App Settings)"
+                    else -> "Not granted"
+                },
                 style = MaterialTheme.typography.labelSmall,
                 color = if (granted) EmeraldSuccess else AmberWarning
             )
         }
         OutlinedButton(onClick = onAction) {
-            Text(if (granted) "Review" else "Grant")
+            Text(
+                actionLabel ?: when {
+                    granted -> "Review"
+                    permanentlyDenied -> "Open App Settings"
+                    else -> "Grant"
+                }
+            )
         }
     }
 }

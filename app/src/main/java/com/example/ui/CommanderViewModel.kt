@@ -1,9 +1,13 @@
 package com.example.ui
 
+import android.Manifest
 import android.app.Application
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.provider.Settings
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.CommanderApplication
@@ -11,6 +15,9 @@ import com.example.ai.DownloadProgressState
 import com.example.ai.ExecutionUiState
 import com.example.ai.LanguageDetector
 import com.example.ai.ModelCatalog
+import com.example.automation.AuthorizedDocumentEntry
+import com.example.automation.CommanderAccessibilityService
+import com.example.automation.ReminderScheduler
 import com.example.data.local.CommandHistoryEntity
 import com.example.data.local.DownloadedModelEntity
 import com.example.data.local.LocalNoteEntity
@@ -26,6 +33,8 @@ import com.example.voice.ActivationSoundPlayer
 import com.example.voice.VoiceListeningState
 import com.example.voice.WakeWordEvent
 import com.example.voice.WakeWordForegroundService
+import java.text.DateFormat
+import java.util.Date
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -43,7 +52,9 @@ data class PermissionStatusSnapshot(
     val calendarGranted: Boolean = false,
     val accessibilityEnabled: Boolean = false,
     val writeSettingsGranted: Boolean = false,
-    val screenCaptureReady: Boolean = false
+    val screenCaptureReady: Boolean = false,
+    val exactAlarmGranted: Boolean = true,
+    val requestedPermissions: Set<String> = emptySet()
 )
 
 class CommanderViewModel(application: Application) : AndroidViewModel(application) {
@@ -65,6 +76,15 @@ class CommanderViewModel(application: Application) : AndroidViewModel(applicatio
 
     val wakeWordServiceRunning: StateFlow<Boolean> = WakeWordForegroundService.isRunning
     val wakeWordMicLevel: StateFlow<Float> = WakeWordForegroundService.micLevel
+
+    private val _permissionStatus = MutableStateFlow(PermissionStatusSnapshot())
+    val permissionStatus: StateFlow<PermissionStatusSnapshot> = _permissionStatus.asStateFlow()
+
+    private val _authorizedDocuments = MutableStateFlow<List<AuthorizedDocumentEntry>>(emptyList())
+    val authorizedDocuments: StateFlow<List<AuthorizedDocumentEntry>> = _authorizedDocuments.asStateFlow()
+
+    private val _documentPreview = MutableStateFlow<Pair<String, String>?>(null)
+    val documentPreview: StateFlow<Pair<String, String>?> = _documentPreview.asStateFlow()
 
     private val _historySearch = MutableStateFlow("")
     val historySearch: StateFlow<String> = _historySearch.asStateFlow()
@@ -118,12 +138,23 @@ class CommanderViewModel(application: Application) : AndroidViewModel(applicatio
     val registeredToolSchemas: List<ToolSchemaInfo> = container.toolRegistry.allSchemas()
 
     init {
+        refreshPermissions()
         refreshDeviceCompatibility()
+        refreshAuthorizedDocuments()
 
         viewModelScope.launch {
             settings.collect { s ->
                 container.voiceOutputManager.configure(s.speechSpeed, s.selectedTtsVoice)
                 container.localLlmEngine.setCommandOnlyMode(s.commandOnlyMode)
+                _permissionStatus.value = _permissionStatus.value.copy(
+                    requestedPermissions = s.requestedPermissions
+                )
+            }
+        }
+
+        viewModelScope.launch {
+            CommanderAccessibilityService.activeService.collect {
+                refreshPermissions()
             }
         }
 
@@ -145,6 +176,55 @@ class CommanderViewModel(application: Application) : AndroidViewModel(applicatio
             }
         }
     }
+
+    fun onAppResumed() {
+        refreshPermissions()
+        refreshSpeechCapabilities()
+        refreshAuthorizedDocuments()
+    }
+
+    fun refreshPermissions() {
+        val context = getApplication<Application>()
+        val mic = ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
+            PackageManager.PERMISSION_GRANTED
+        val notif = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) ==
+                PackageManager.PERMISSION_GRANTED
+        } else {
+            true
+        }
+        val contacts = ContextCompat.checkSelfPermission(context, Manifest.permission.READ_CONTACTS) ==
+            PackageManager.PERMISSION_GRANTED
+        val calendar = ContextCompat.checkSelfPermission(context, Manifest.permission.WRITE_CALENDAR) ==
+            PackageManager.PERMISSION_GRANTED
+        val accessibility = CommanderAccessibilityService.isConnected()
+        val writeSettings = runCatching { Settings.System.canWrite(context) }.getOrDefault(false)
+        val screenCapture = container.screenUnderstandingManager.hasProjectionGrant()
+        val exactAlarm = container.reminderScheduler.canScheduleExactAlarms()
+
+        _permissionStatus.value = PermissionStatusSnapshot(
+            microphoneGranted = mic,
+            notificationsGranted = notif,
+            contactsGranted = contacts,
+            calendarGranted = calendar,
+            accessibilityEnabled = accessibility,
+            writeSettingsGranted = writeSettings,
+            screenCaptureReady = screenCapture,
+            exactAlarmGranted = exactAlarm,
+            requestedPermissions = settings.value.requestedPermissions
+        )
+    }
+
+    fun markPermissionsRequested(permissions: List<String>) {
+        if (permissions.isEmpty()) return
+        viewModelScope.launch {
+            container.preferences.markPermissionsRequested(permissions.toSet())
+            refreshPermissions()
+        }
+    }
+
+    fun canExplainScreenWithoutDialog(): Boolean =
+        container.screenUnderstandingManager.canAnalyzeWithoutProjectionDialog()
 
     private fun handleWakeWordTriggered(event: WakeWordEvent.Detected) {
         viewModelScope.launch {
@@ -436,6 +516,7 @@ class CommanderViewModel(application: Application) : AndroidViewModel(applicatio
     fun onScreenCaptureResult(resultCode: Int, data: Intent?) {
         if (resultCode == android.app.Activity.RESULT_OK && data != null) {
             container.screenUnderstandingManager.setProjectionGrant(resultCode, data)
+            refreshPermissions()
             submitCommand("Explain my screen")
         } else {
             _snackbarMessage.value = "Screen capture permission was cancelled."
@@ -464,7 +545,7 @@ class CommanderViewModel(application: Application) : AndroidViewModel(applicatio
             appendLine("AI Phone Commander — Local Command History Export")
             appendLine("=================================================")
             all.forEach { entry ->
-                appendLine("[${java.util.Date(entry.timestamp)}] (${entry.resultStatus}) [${entry.engineUsed}]")
+                appendLine("[${Date(entry.timestamp)}] (${entry.resultStatus}) [${entry.engineUsed}]")
                 appendLine("Command: ${entry.commandText}")
                 appendLine("Interpretation: ${entry.aiInterpretation}")
                 appendLine("Result: ${entry.resultSummary}")
@@ -474,8 +555,56 @@ class CommanderViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
+    fun createReminder(title: String, delayMinutes: Long, notes: String = "") {
+        val cleanTitle = title.trim()
+        if (cleanTitle.isBlank()) return
+        viewModelScope.launch {
+            val triggerAt = System.currentTimeMillis() + delayMinutes.coerceAtLeast(1L) * 60_000L
+            val entity = LocalReminderEntity(title = cleanTitle, triggerAtMillis = triggerAt, notes = notes.trim())
+            val id = container.database.localReminderDao().insert(entity)
+            val result = container.reminderScheduler.scheduleReminder(entity.copy(id = id))
+            val timeStr = DateFormat.getTimeInstance(DateFormat.SHORT).format(Date(result.triggerAtMillis))
+            _snackbarMessage.value = if (result.notificationPermissionGranted) {
+                "Reminder \"$cleanTitle\" scheduled for $timeStr (${result.mechanism.label})."
+            } else {
+                "Reminder saved for $timeStr. Enable Notifications in Settings for alert banners."
+            }
+        }
+    }
+
+    fun rescheduleReminder(id: Long, newTitle: String, delayMinutes: Long, notes: String = "") {
+        val cleanTitle = newTitle.trim()
+        if (cleanTitle.isBlank()) return
+        viewModelScope.launch {
+            val dao = container.database.localReminderDao()
+            val existing = dao.getById(id) ?: return@launch
+            val triggerAt = System.currentTimeMillis() + delayMinutes.coerceAtLeast(1L) * 60_000L
+            val updated = existing.copy(
+                title = cleanTitle,
+                triggerAtMillis = triggerAt,
+                notes = notes.trim(),
+                isCompleted = false
+            )
+            dao.updateReminder(updated)
+            val result = container.reminderScheduler.scheduleReminder(updated)
+            val timeStr = DateFormat.getTimeInstance(DateFormat.SHORT).format(Date(result.triggerAtMillis))
+            _snackbarMessage.value = "Rescheduled \"$cleanTitle\" for $timeStr (${result.mechanism.label})."
+        }
+    }
+
     fun toggleReminderCompleted(id: Long, completed: Boolean) {
-        viewModelScope.launch { container.database.localReminderDao().setCompleted(id, completed) }
+        viewModelScope.launch {
+            val dao = container.database.localReminderDao()
+            dao.setCompleted(id, completed)
+            if (completed) {
+                container.reminderScheduler.cancelReminder(id)
+            } else {
+                val item = dao.getById(id)
+                if (item != null && !item.isCompleted) {
+                    container.reminderScheduler.scheduleReminder(item)
+                }
+            }
+        }
     }
 
     fun deleteNote(id: Long) {
@@ -483,7 +612,62 @@ class CommanderViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun deleteReminder(id: Long) {
-        viewModelScope.launch { container.database.localReminderDao().deleteById(id) }
+        viewModelScope.launch {
+            container.reminderScheduler.cancelReminder(id)
+            container.database.localReminderDao().deleteById(id)
+        }
+    }
+
+    // SAF Document & Folder Access
+    fun refreshAuthorizedDocuments() {
+        viewModelScope.launch {
+            _authorizedDocuments.value = container.documentAccessManager.getAuthorizedEntries()
+        }
+    }
+
+    fun authorizeDocumentFile(uri: Uri) {
+        viewModelScope.launch {
+            val res = container.documentAccessManager.authorizePickedFile(uri)
+            refreshAuthorizedDocuments()
+            _snackbarMessage.value = res.fold(
+                onSuccess = { "Authorized file: ${it.displayName}" },
+                onFailure = { it.message ?: "Unable to read selected file" }
+            )
+        }
+    }
+
+    fun authorizeDocumentFolder(treeUri: Uri) {
+        viewModelScope.launch {
+            val res = container.documentAccessManager.authorizePickedFolder(treeUri)
+            refreshAuthorizedDocuments()
+            _snackbarMessage.value = res.fold(
+                onSuccess = { "Authorized folder: ${it.displayName} (persisted SAF read access)" },
+                onFailure = { it.message ?: "Unable to access selected folder" }
+            )
+        }
+    }
+
+    fun revokeDocumentAccess(uriString: String) {
+        viewModelScope.launch {
+            container.documentAccessManager.revokeAccess(uriString)
+            refreshAuthorizedDocuments()
+            _snackbarMessage.value = "Document access revoked."
+        }
+    }
+
+    fun previewAuthorizedDocument(entry: AuthorizedDocumentEntry) {
+        viewModelScope.launch {
+            val uri = runCatching { Uri.parse(entry.uriString) }.getOrNull() ?: return@launch
+            val res = container.documentAccessManager.readTextPreview(uri)
+            res.fold(
+                onSuccess = { text -> _documentPreview.value = entry.displayName to text },
+                onFailure = { err -> _snackbarMessage.value = err.message ?: "Preview unavailable" }
+            )
+        }
+    }
+
+    fun dismissDocumentPreview() {
+        _documentPreview.value = null
     }
 
     fun clearSnackbar() {
@@ -510,6 +694,25 @@ class CommanderViewModel(application: Application) : AndroidViewModel(applicatio
             )
         }.onFailure {
             _snackbarMessage.value = "Unable to open Modify System Settings screen."
+        }
+    }
+
+    fun openExactAlarmSettings() {
+        val context = getApplication<Application>()
+        if (!ReminderScheduler.openExactAlarmSettings(context)) {
+            _snackbarMessage.value = "Exact alarm setting is not required or unavailable on this Android version."
+        }
+    }
+
+    fun openAppSettings() {
+        val context = getApplication<Application>()
+        runCatching {
+            context.startActivity(
+                Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:${context.packageName}"))
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            )
+        }.onFailure {
+            _snackbarMessage.value = "Unable to open App Settings screen."
         }
     }
 

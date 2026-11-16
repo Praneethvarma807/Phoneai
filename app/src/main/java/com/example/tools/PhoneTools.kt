@@ -16,6 +16,8 @@ import android.provider.MediaStore
 import android.provider.Settings
 import androidx.core.content.ContextCompat
 import com.example.automation.CommanderAccessibilityService
+import com.example.automation.DocumentAccessManager
+import com.example.automation.ReminderScheduler
 import com.example.automation.ScreenUnderstandingManager
 import com.example.data.local.LocalNoteDao
 import com.example.data.local.LocalNoteEntity
@@ -26,13 +28,17 @@ import com.example.domain.model.ExecutionStatus
 import com.example.domain.model.ToolResult
 import com.example.domain.model.ToolSchemaInfo
 import java.net.URLEncoder
+import java.text.DateFormat
+import java.util.Date
 
 object PhoneToolsFactory {
     fun createAll(
         context: Context,
         noteDao: LocalNoteDao,
         reminderDao: LocalReminderDao,
-        screenUnderstandingManager: ScreenUnderstandingManager
+        screenUnderstandingManager: ScreenUnderstandingManager,
+        reminderScheduler: ReminderScheduler = ReminderScheduler(context),
+        documentAccessManager: DocumentAccessManager? = null
     ): List<CommanderTool> = listOf(
         OpenAppTool(context),
         CheckAppInstalledTool(context),
@@ -47,13 +53,13 @@ object PhoneToolsFactory {
         AdjustBrightnessTool(context),
         AdjustVolumeTool(context),
         OpenSettingsTool(context),
-        CreateReminderTool(reminderDao),
+        CreateReminderTool(reminderDao, reminderScheduler),
         CreateCalendarEventTool(context),
         SearchContactsTool(context),
         ComposeSmsTool(context),
         ComposeEmailTool(context),
         SendWhatsAppDraftTool(context),
-        SearchFilesTool(context),
+        SearchFilesTool(context, documentAccessManager),
         CreateNoteTool(noteDao),
         SetAlarmTool(context),
         OpenDownloadsTool(context)
@@ -631,14 +637,22 @@ class OpenSettingsTool(private val context: Context) : CommanderTool {
     }
 }
 
-class CreateReminderTool(private val reminderDao: LocalReminderDao) : CommanderTool {
+class CreateReminderTool(
+    private val reminderDao: LocalReminderDao,
+    private val reminderScheduler: ReminderScheduler? = null
+) : CommanderTool {
     override val category = ActionCategory.CALENDAR
     override val schema = ToolSchemaInfo(
         name = "create_reminder",
-        description = "Create and save a local reminder in the on-device database.",
-        requiredPermissions = emptyList(),
+        description = "Create, save, and schedule a local reminder with AlarmManager/WorkManager notifications.",
+        requiredPermissions = listOf("POST_NOTIFICATIONS (API 33+)"),
         requiresConfirmation = false,
-        parameters = mapOf("title" to "string (required)", "delay_minutes" to "optional integer"),
+        parameters = mapOf(
+            "title" to "string (required)",
+            "delay_minutes" to "optional integer",
+            "trigger_at_millis" to "optional epoch millis",
+            "notes" to "optional string"
+        ),
         category = category.name
     )
 
@@ -647,15 +661,40 @@ class CreateReminderTool(private val reminderDao: LocalReminderDao) : CommanderT
 
     override suspend fun execute(arguments: Map<String, String>): ToolResult {
         val title = arguments.getValue("title").trim()
-        val delayMin = arguments["delay_minutes"]?.toLongOrNull() ?: 60L
-        val triggerAt = System.currentTimeMillis() + delayMin * 60_000L
-        val id = reminderDao.insert(LocalReminderEntity(title = title, triggerAtMillis = triggerAt))
+        val notes = arguments["notes"]?.trim().orEmpty()
+        val explicitTrigger = arguments["trigger_at_millis"]?.toLongOrNull()
+        val delayMin = (arguments["delay_minutes"]?.toLongOrNull() ?: 60L).coerceAtLeast(1L)
+        val triggerAt = explicitTrigger?.takeIf { it > System.currentTimeMillis() }
+            ?: (System.currentTimeMillis() + delayMin * 60_000L)
+
+        val entity = LocalReminderEntity(title = title, triggerAtMillis = triggerAt, notes = notes)
+        val id = reminderDao.insert(entity)
+        val persisted = entity.copy(id = id)
+        val scheduleResult = reminderScheduler?.scheduleReminder(persisted)
+
+        val formattedTime = DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT).format(Date(triggerAt))
+        val notifNote = if (scheduleResult != null && !scheduleResult.notificationPermissionGranted) {
+            " Allow Notifications in Settings to receive alert banners."
+        } else {
+            ""
+        }
+        val mechLabel = scheduleResult?.mechanism?.label ?: "Room Only"
+
         return ToolResult(
             toolName = schema.name,
             status = ExecutionStatus.SUCCESS,
-            message = "Saved reminder #$id: \"$title\".",
-            verificationNote = "Persisted in Room local_reminders table (id=$id)",
-            data = mapOf("reminder_id" to id.toString(), "title" to title),
+            message = "Scheduled reminder #$id: \"$title\" for $formattedTime.$notifNote",
+            verificationNote = "Persisted in Room (id=$id) & scheduled via $mechLabel",
+            data = buildMap {
+                put("reminder_id", id.toString())
+                put("title", title)
+                put("trigger_at_millis", triggerAt.toString())
+                put("mechanism", mechLabel)
+                if (scheduleResult != null) {
+                    put("notifications_granted", scheduleResult.notificationPermissionGranted.toString())
+                    put("exact_alarm_granted", scheduleResult.exactAlarmPermissionGranted.toString())
+                }
+            },
             category = category
         )
     }
@@ -847,7 +886,7 @@ class SendWhatsAppDraftTool(private val context: Context) : CommanderTool {
     override val category = ActionCategory.MESSAGING
     override val schema = ToolSchemaInfo(
         name = "send_whatsapp_draft",
-        description = "Prepare a WhatsApp message draft (opens WhatsApp composer; requires confirmation).",
+        description = "Prepare a WhatsApp message draft (opens WhatsApp chat or composer; requires confirmation).",
         requiredPermissions = emptyList(),
         requiresConfirmation = true,
         parameters = mapOf("recipient" to "optional name/number", "message" to "message text"),
@@ -855,38 +894,175 @@ class SendWhatsAppDraftTool(private val context: Context) : CommanderTool {
     )
 
     override suspend fun execute(arguments: Map<String, String>): ToolResult {
+        val recipient = arguments["recipient"].orEmpty().trim()
         val msg = arguments["message"].orEmpty().trim()
-        val intent = Intent(Intent.ACTION_SEND).apply {
-            type = "text/plain"
-            setPackage("com.whatsapp")
-            putExtra(Intent.EXTRA_TEXT, msg)
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        }
-        if (intent.resolveActivity(context.packageManager) != null) {
-            context.startActivity(intent)
+        if (recipient.isBlank() && msg.isBlank()) {
             return ToolResult(
                 toolName = schema.name,
-                status = ExecutionStatus.SUCCESS,
-                message = "Opened WhatsApp with prepared message draft.",
-                verificationNote = "WhatsApp ACTION_SEND launched",
+                status = ExecutionStatus.FAILED,
+                message = "Provide a WhatsApp recipient or message text before drafting.",
+                verificationNote = "Empty WhatsApp draft arguments",
                 category = category
             )
         }
+        if (recipient.isNotBlank() && isMalformedPhoneInput(recipient)) {
+            return ToolResult(
+                toolName = schema.name,
+                status = ExecutionStatus.FAILED,
+                message = "Invalid WhatsApp recipient \"$recipient\". Enter a full phone number (at least 7 digits) or a contact name.",
+                verificationNote = "Malformed numeric/punctuation recipient rejected",
+                category = category
+            )
+        }
+        val whatsappPkg = resolveInstalledWhatsAppPackage()
+            ?: return ToolResult(
+                toolName = schema.name,
+                status = ExecutionStatus.FAILED,
+                message = "WhatsApp is not installed on this device.",
+                verificationNote = "Neither com.whatsapp nor com.whatsapp.w4b resolved",
+                category = category
+            )
+
+        val resolvedDigits = resolveRecipientPhoneDigits(recipient)
+        if (resolvedDigits != null) {
+            val encodedText = Uri.encode(msg)
+            val waUri = if (msg.isNotBlank()) {
+                Uri.parse("https://wa.me/$resolvedDigits?text=$encodedText")
+            } else {
+                Uri.parse("https://wa.me/$resolvedDigits")
+            }
+            val directIntent = Intent(Intent.ACTION_VIEW, waUri).apply {
+                setPackage(whatsappPkg)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            if (directIntent.resolveActivity(context.packageManager) != null) {
+                context.startActivity(directIntent)
+                return ToolResult(
+                    toolName = schema.name,
+                    status = ExecutionStatus.SUCCESS,
+                    message = "Opened WhatsApp draft for ${recipient.ifBlank { resolvedDigits }}.",
+                    verificationNote = "WhatsApp direct chat URI launched ($whatsappPkg)",
+                    data = mapOf(
+                        "package" to whatsappPkg,
+                        "recipient_digits" to resolvedDigits,
+                        "mode" to "direct_chat"
+                    ),
+                    category = category
+                )
+            }
+        }
+
+        val shareIntent = Intent(Intent.ACTION_SEND).apply {
+            type = "text/plain"
+            setPackage(whatsappPkg)
+            putExtra(Intent.EXTRA_TEXT, msg)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        if (shareIntent.resolveActivity(context.packageManager) != null) {
+            context.startActivity(shareIntent)
+            val message = if (recipient.isNotBlank()) {
+                "Opened WhatsApp with prepared message draft (select \"$recipient\" in WhatsApp, or provide a phone number / Contacts permission for direct targeting)."
+            } else {
+                "Opened WhatsApp with prepared message draft."
+            }
+            return ToolResult(
+                toolName = schema.name,
+                status = ExecutionStatus.SUCCESS,
+                message = message,
+                verificationNote = "WhatsApp ACTION_SEND launched ($whatsappPkg)",
+                data = mapOf(
+                    "package" to whatsappPkg,
+                    "mode" to "share_composer"
+                ),
+                category = category
+            )
+        }
+
         return ToolResult(
             toolName = schema.name,
             status = ExecutionStatus.FAILED,
-            message = "WhatsApp is not installed on this device.",
-            verificationNote = "com.whatsapp not found",
+            message = "Unable to open WhatsApp composer on this device.",
+            verificationNote = "WhatsApp intent unresolved for $whatsappPkg",
             category = category
         )
     }
+
+    internal fun resolveInstalledWhatsAppPackage(): String? {
+        val pm = context.packageManager
+        for (pkg in WHATSAPP_PACKAGES) {
+            val probeSend = Intent(Intent.ACTION_SEND).apply {
+                type = "text/plain"
+                setPackage(pkg)
+            }
+            if (probeSend.resolveActivity(pm) != null) return pkg
+
+            val probeView = Intent(Intent.ACTION_VIEW, Uri.parse("https://wa.me/1234567")).apply {
+                setPackage(pkg)
+            }
+            if (probeView.resolveActivity(pm) != null) return pkg
+        }
+        return null
+    }
+
+    internal fun resolveRecipientPhoneDigits(recipient: String): String? {
+        if (recipient.isBlank()) return null
+        extractPhoneDigitsIfNumeric(recipient)?.let { return it }
+
+        if (!context.hasPermission(Manifest.permission.READ_CONTACTS)) {
+            return null
+        }
+
+        return runCatching {
+            val projection = arrayOf(
+                ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
+                ContactsContract.CommonDataKinds.Phone.NUMBER
+            )
+            context.contentResolver.query(
+                ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+                projection,
+                "${ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME} LIKE ?",
+                arrayOf("%$recipient%"),
+                "${ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME} ASC"
+            )?.use { cursor ->
+                while (cursor.moveToNext()) {
+                    val number = cursor.getString(1).orEmpty()
+                    val digits = extractPhoneDigitsIfNumeric(number)
+                    if (digits != null) return@runCatching digits
+                }
+                null
+            }
+        }.getOrNull()
+    }
+
+    companion object {
+        private val WHATSAPP_PACKAGES = listOf("com.whatsapp", "com.whatsapp.w4b")
+
+        internal fun extractPhoneDigitsIfNumeric(raw: String): String? {
+            val trimmed = raw.trim()
+            if (trimmed.isEmpty()) return null
+            if (trimmed.any { it.isLetter() }) return null
+            val digits = trimmed.filter { it.isDigit() }
+            return digits.takeIf { it.length >= 7 }
+        }
+
+        internal fun isMalformedPhoneInput(raw: String): Boolean {
+            val trimmed = raw.trim()
+            if (trimmed.isEmpty()) return false
+            if (trimmed.any { it.isLetter() }) return false
+            val digits = trimmed.count { it.isDigit() }
+            return digits < 7
+        }
+    }
 }
 
-class SearchFilesTool(private val context: Context) : CommanderTool {
+class SearchFilesTool(
+    private val context: Context,
+    private val documentAccessManager: DocumentAccessManager? = null
+) : CommanderTool {
     override val category = ActionCategory.DOCUMENT
     override val schema = ToolSchemaInfo(
         name = "search_files",
-        description = "Search local documents and app-created files without broad storage permissions.",
+        description = "Search SAF-authorized documents, internal files, and Downloads without broad storage permissions.",
         requiredPermissions = emptyList(),
         requiresConfirmation = false,
         parameters = mapOf("query" to "optional filename keyword"),
@@ -897,14 +1073,21 @@ class SearchFilesTool(private val context: Context) : CommanderTool {
         val query = arguments["query"].orEmpty().trim().lowercase()
         val found = mutableListOf<String>()
 
-        // 1. Check app-local exported/created files
+        // 1. Search persisted Storage Access Framework (SAF) files and folders
+        val safResult = documentAccessManager?.searchAuthorizedDocuments(query)
+        safResult?.matches?.forEach { match ->
+            val kb = if (match.sizeBytes >= 0) "${(match.sizeBytes / 1024).coerceAtLeast(1)} KB, " else ""
+            found.add("${match.displayName} (${kb}${match.sourceLabel})")
+        }
+
+        // 2. Check app-local exported/created files
         context.filesDir.listFiles()?.forEach { file ->
             if (file.isFile && (query.isBlank() || file.name.lowercase().contains(query))) {
                 found.add("${file.name} (${file.length() / 1024} KB, internal)")
             }
         }
 
-        // 2. Query MediaStore Downloads (accessible without broad READ_EXTERNAL_STORAGE on API 29+)
+        // 3. Query MediaStore Downloads (accessible without broad READ_EXTERNAL_STORAGE on API 29+)
         runCatching {
             val projection = arrayOf(MediaStore.MediaColumns.DISPLAY_NAME, MediaStore.MediaColumns.SIZE)
             context.contentResolver.query(
@@ -914,26 +1097,41 @@ class SearchFilesTool(private val context: Context) : CommanderTool {
                 null,
                 "${MediaStore.MediaColumns.DATE_MODIFIED} DESC"
             )?.use { cursor ->
-                while (cursor.moveToNext() && found.size < 12) {
+                while (cursor.moveToNext() && found.size < 16) {
                     val name = cursor.getString(0) ?: continue
                     val size = cursor.getLong(1)
                     if (query.isBlank() || name.lowercase().contains(query)) {
-                        found.add("$name (${size / 1024} KB)")
+                        found.add("$name (${size / 1024} KB, Downloads)")
                     }
                 }
             }
         }
 
+        val revokedNote = if (safResult != null && safResult.revokedOrMissing.isNotEmpty()) {
+            " (${safResult.revokedOrMissing.size} previously authorized item(s) became unavailable or revoked.)"
+        } else {
+            ""
+        }
+
+        val safCount = safResult?.matches?.size ?: 0
+        val message = if (found.isEmpty()) {
+            "No accessible documents matched '$query'.$revokedNote Use Open PDF / Authorize Folder in Tools to grant zero-permission SAF access."
+        } else {
+            "Found ${found.size} document(s): ${found.joinToString(", ")}$revokedNote"
+        }
+
         return ToolResult(
             toolName = schema.name,
             status = ExecutionStatus.SUCCESS,
-            message = if (found.isEmpty()) {
-                "No accessible documents matched '$query'. Use the Document Picker in Tools to open any PDF/file."
-            } else {
-                "Found ${found.size} document(s): ${found.joinToString(", ")}"
+            message = message,
+            verificationNote = "Queried SAF roots ($safCount matches), internal files & MediaStore Downloads",
+            data = buildMap {
+                put("files", found.joinToString("\n"))
+                put("saf_matches", safCount.toString())
+                if (safResult != null && safResult.matches.isNotEmpty()) {
+                    put("first_saf_uri", safResult.matches.first().uriString)
+                }
             },
-            verificationNote = "Queried internal files & MediaStore Downloads",
-            data = mapOf("files" to found.joinToString("\n")),
             category = category
         )
     }
