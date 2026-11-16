@@ -1,6 +1,7 @@
 package com.example
 
 import android.Manifest
+import android.app.ActivityManager
 import android.app.AlarmManager
 import android.app.Application
 import android.app.NotificationManager
@@ -12,6 +13,7 @@ import android.database.Cursor
 import android.database.MatrixCursor
 import android.net.Uri
 import android.os.Build
+import android.os.Looper
 import android.os.ParcelFileDescriptor
 import android.provider.DocumentsContract
 import android.provider.OpenableColumns
@@ -39,9 +41,11 @@ import com.example.ui.CommanderViewModel
 import com.example.voice.VoiceOutputManager
 import java.io.File
 import java.security.MessageDigest
-import kotlinx.coroutines.delay
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -61,6 +65,8 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows
 import org.robolectric.annotation.Config
 import org.robolectric.shadows.ShadowAlarmManager
+import org.robolectric.shadows.ShadowStatFs
+import org.robolectric.util.ReflectionHelpers
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [34])
@@ -251,7 +257,7 @@ class Phase2And3RegressionTest {
         assertTrue(viewModel.permissionStatus.value.microphoneGranted)
 
         viewModel.markPermissionsRequested(listOf(Manifest.permission.RECORD_AUDIO))
-        delay(100)
+        Shadows.shadowOf(Looper.getMainLooper()).idle()
         assertTrue(Manifest.permission.RECORD_AUDIO in viewModel.permissionStatus.value.requestedPermissions)
     }
 
@@ -320,77 +326,91 @@ class Phase2And3RegressionTest {
 
     @Test
     fun `model download manager rejects HTML responses validates ETag SHA256 and supports resume cleanup`() = runTest {
-        val compat = DeviceCompatibilityManager(app)
-        val payload = ByteArray(1_100_000) { idx -> (idx % 251).toByte() }
-        val expectedSha = MessageDigest.getInstance("SHA-256")
-            .digest(payload)
-            .joinToString("") { "%02x".format(it) }
+        val originalAbis = Build.SUPPORTED_ABIS
+        try {
+            ReflectionHelpers.setStaticField(Build::class.java, "SUPPORTED_ABIS", arrayOf("arm64-v8a"))
+            val am = app.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+            Shadows.shadowOf(am).setMemoryInfo(ActivityManager.MemoryInfo().apply {
+                totalMem = 6L * 1024L * 1024L * 1024L
+                availMem = 3L * 1024L * 1024L * 1024L
+            })
+            ShadowStatFs.registerStats(app.filesDir.absolutePath, 1_000_000, 500_000, 500_000)
 
-        // Test 1: Reject text/html payload
-        val htmlClient = OkHttpClient.Builder()
-            .addInterceptor(Interceptor { chain ->
-                Response.Builder()
-                    .request(chain.request())
-                    .protocol(Protocol.HTTP_1_1)
-                    .code(200)
-                    .message("OK")
-                    .header("Content-Type", "text/html; charset=utf-8")
-                    .body("<html>Login Required</html>".toResponseBody("text/html".toMediaType()))
-                    .build()
-            }).build()
+            val compat = DeviceCompatibilityManager(app)
+            val payload = ByteArray(1_100_000) { idx -> (idx % 251).toByte() }
+            val expectedSha = MessageDigest.getInstance("SHA-256")
+                .digest(payload)
+                .joinToString("") { "%02x".format(it) }
 
-        val spec = LocalModelSpec(
-            id = "test-model",
-            displayName = "Test Model",
-            family = "Test",
-            fileName = "test_model.litertlm",
-            downloadUrl = "https://example.org/test_model.litertlm",
-            expectedSizeBytes = payload.size.toLong(),
-            minRamMb = 1L,
-            minStorageMb = 1L,
-            license = "Apache 2.0",
-            description = "Test",
-            recommendedTier = com.example.domain.model.DeviceTier.LOW_RAM
-        )
+            // Test 1: Reject text/html payload
+            val htmlClient = OkHttpClient.Builder()
+                .addInterceptor(Interceptor { chain ->
+                    Response.Builder()
+                        .request(chain.request())
+                        .protocol(Protocol.HTTP_1_1)
+                        .code(200)
+                        .message("OK")
+                        .header("Content-Type", "text/html; charset=utf-8")
+                        .body("<html>Login Required</html>".toResponseBody("text/html".toMediaType()))
+                        .build()
+                }).build()
 
-        val dlHtml = ModelDownloadManager(app, db.downloadedModelDao(), compat, htmlClient)
-        dlHtml.startOrResumeDownload(spec)
-        var guard = 0
-        while (dlHtml.progress.value[spec.id]?.status != ModelInstallStatus.FAILED && guard < 40) {
-            delay(50)
-            guard++
+            val spec = LocalModelSpec(
+                id = "test-model",
+                displayName = "Test Model",
+                family = "Test",
+                fileName = "test_model.litertlm",
+                downloadUrl = "https://example.org/test_model.litertlm",
+                expectedSizeBytes = payload.size.toLong(),
+                minRamMb = 1L,
+                minStorageMb = 1L,
+                license = "Apache 2.0",
+                description = "Test",
+                recommendedTier = com.example.domain.model.DeviceTier.LOW_RAM
+            )
+
+            val dlHtml = ModelDownloadManager(app, db.downloadedModelDao(), compat, htmlClient)
+            dlHtml.startOrResumeDownload(spec)
+            val failedState = withContext(Dispatchers.Default) {
+                withTimeout(5_000L) {
+                    dlHtml.progress.first { it[spec.id]?.status == ModelInstallStatus.FAILED }
+                }
+            }
+            assertEquals(ModelInstallStatus.FAILED, failedState[spec.id]?.status)
+            assertTrue(failedState[spec.id]?.error?.contains("text/html") == true)
+            dlHtml.shutdown()
+
+            // Test 2: Binary download with matching X-Linked-ETag SHA-256 succeeds & verifies
+            val okClient = OkHttpClient.Builder()
+                .addInterceptor(Interceptor { chain ->
+                    Response.Builder()
+                        .request(chain.request())
+                        .protocol(Protocol.HTTP_1_1)
+                        .code(200)
+                        .message("OK")
+                        .header("Content-Type", "application/octet-stream")
+                        .header("X-Linked-ETag", "\"$expectedSha\"")
+                        .body(payload.toResponseBody("application/octet-stream".toMediaType()))
+                        .build()
+                }).build()
+
+            val dlOk = ModelDownloadManager(app, db.downloadedModelDao(), compat, okClient)
+            dlOk.startOrResumeDownload(spec)
+            val readyState = withContext(Dispatchers.Default) {
+                withTimeout(10_000L) {
+                    dlOk.progress.first { it[spec.id]?.status == ModelInstallStatus.READY }
+                }
+            }
+            assertEquals(ModelInstallStatus.READY, readyState[spec.id]?.status)
+            val verified = dlOk.validateInstalledModel(spec.id)
+            assertTrue(verified.isSuccess)
+            assertTrue(verified.getOrThrow().contains(expectedSha.take(12)))
+            dlOk.deleteModel(spec.id)
+            dlOk.shutdown()
+        } finally {
+            ReflectionHelpers.setStaticField(Build::class.java, "SUPPORTED_ABIS", originalAbis)
+            ShadowStatFs.reset()
         }
-        assertEquals(ModelInstallStatus.FAILED, dlHtml.progress.value[spec.id]?.status)
-        assertTrue(dlHtml.progress.value[spec.id]?.error?.contains("text/html") == true)
-        dlHtml.shutdown()
-
-        // Test 2: Binary download with matching X-Linked-ETag SHA-256 succeeds & verifies
-        val okClient = OkHttpClient.Builder()
-            .addInterceptor(Interceptor { chain ->
-                Response.Builder()
-                    .request(chain.request())
-                    .protocol(Protocol.HTTP_1_1)
-                    .code(200)
-                    .message("OK")
-                    .header("Content-Type", "application/octet-stream")
-                    .header("X-Linked-ETag", "\"$expectedSha\"")
-                    .body(payload.toResponseBody("application/octet-stream".toMediaType()))
-                    .build()
-            }).build()
-
-        val dlOk = ModelDownloadManager(app, db.downloadedModelDao(), compat, okClient)
-        dlOk.startOrResumeDownload(spec)
-        guard = 0
-        while (dlOk.progress.value[spec.id]?.status != ModelInstallStatus.READY && guard < 60) {
-            delay(50)
-            guard++
-        }
-        assertEquals(ModelInstallStatus.READY, dlOk.progress.value[spec.id]?.status)
-        val verified = dlOk.validateInstalledModel(spec.id)
-        assertTrue(verified.isSuccess)
-        assertTrue(verified.getOrThrow().contains(expectedSha.take(12)))
-        dlOk.deleteModel(spec.id)
-        dlOk.shutdown()
     }
 }
 

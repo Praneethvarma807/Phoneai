@@ -171,12 +171,26 @@ abstract class CommanderDatabase : RoomDatabase() {
     abstract fun downloadedModelDao(): DownloadedModelDao
 
     companion object {
-        fun build(context: Context): CommanderDatabase =
-            Room.databaseBuilder(
-                context.applicationContext,
-                CommanderDatabase::class.java,
-                "ai_phone_commander.db"
-            ).fallbackToDestructiveMigration(dropAllTables = true)
-                .build()
+        @Volatile
+        private var instance: CommanderDatabase? = null
+
+        fun build(context: Context): CommanderDatabase {
+            val current = instance
+            if (current != null && current.isOpen) return current
+            return synchronized(this) {
+                val existing = instance
+                if (existing != null && existing.isOpen) {
+                    existing
+                } else {
+                    Room.databaseBuilder(
+                        context.applicationContext,
+                        CommanderDatabase::class.java,
+                        "ai_phone_commander.db"
+                    ).fallbackToDestructiveMigration(dropAllTables = true)
+                        .build()
+                        .also { instance = it }
+                }
+            }
+        }
     }
 }

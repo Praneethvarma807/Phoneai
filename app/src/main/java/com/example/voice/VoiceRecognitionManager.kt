@@ -18,6 +18,7 @@ import android.speech.RecognitionSupport
 import android.speech.RecognitionSupportCallback
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
+import androidx.annotation.RequiresApi
 import androidx.core.content.ContextCompat
 import com.example.ai.LanguageDetector
 import com.example.domain.model.AppLanguage
@@ -68,6 +69,7 @@ internal interface SpeechRecognizerHandle {
     fun stopListening()
     fun cancel()
     fun destroy()
+    @RequiresApi(Build.VERSION_CODES.TIRAMISU)
     fun checkRecognitionSupport(
         intent: Intent,
         executor: Executor,
@@ -114,16 +116,13 @@ private class AndroidSpeechRecognizerHandle(
         delegate.destroy()
     }
 
+    @RequiresApi(Build.VERSION_CODES.TIRAMISU)
     override fun checkRecognitionSupport(
         intent: Intent,
         executor: Executor,
         callback: RecognitionSupportCallback
     ) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            delegate.checkRecognitionSupport(intent, executor, callback)
-        } else {
-            callback.onError(SpeechRecognizer.ERROR_CANNOT_CHECK_SUPPORT)
-        }
+        delegate.checkRecognitionSupport(intent, executor, callback)
     }
 
     override fun triggerModelDownload(
@@ -358,34 +357,17 @@ class VoiceRecognitionManager internal constructor(
             mainHandler.postDelayed(timeoutRunnable, SUPPORT_CHECK_TIMEOUT_MS)
 
             try {
-                checker.checkRecognitionSupport(
-                    probeIntent,
-                    mainExecutor,
-                    object : RecognitionSupportCallback {
-                        override fun onSupportResult(recognitionSupport: RecognitionSupport) {
-                            if (!completed.compareAndSet(false, true)) return
-                            mainHandler.removeCallbacks(timeoutRunnable)
-                            runCatching { checker.destroy() }
-                            if (supportChecker === checker) supportChecker = null
-
-                            applyRecognitionSupportResult(recognitionSupport)
-                            onCompleted?.invoke(_state.value)
-                        }
-
-                        override fun onError(error: Int) {
-                            if (!completed.compareAndSet(false, true)) return
-                            mainHandler.removeCallbacks(timeoutRunnable)
-                            runCatching { checker.destroy() }
-                            if (supportChecker === checker) supportChecker = null
-
-                            if (error == SpeechRecognizer.ERROR_SERVER_DISCONNECTED) {
-                                onDeviceDisqualified = true
-                            }
-                            markSupportUnverified(error, targetLanguage)
-                            onCompleted?.invoke(_state.value)
-                        }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    probeSupportApi33(checker, probeIntent, completed, timeoutRunnable, targetLanguage, onCompleted)
+                } else {
+                    if (completed.compareAndSet(false, true)) {
+                        mainHandler.removeCallbacks(timeoutRunnable)
+                        runCatching { checker.destroy() }
+                        if (supportChecker === checker) supportChecker = null
+                        markSupportUnverified(SpeechRecognizer.ERROR_CANNOT_CHECK_SUPPORT, targetLanguage)
+                        onCompleted?.invoke(_state.value)
                     }
-                )
+                }
             } catch (_: Throwable) {
                 if (completed.compareAndSet(false, true)) {
                     mainHandler.removeCallbacks(timeoutRunnable)
@@ -398,6 +380,46 @@ class VoiceRecognitionManager internal constructor(
         }
     }
 
+    @RequiresApi(Build.VERSION_CODES.TIRAMISU)
+    private fun probeSupportApi33(
+        checker: SpeechRecognizerHandle,
+        probeIntent: Intent,
+        completed: AtomicBoolean,
+        timeoutRunnable: Runnable,
+        targetLanguage: SpeechLanguageOption,
+        onCompleted: ((VoiceListeningState) -> Unit)?
+    ) {
+        checker.checkRecognitionSupport(
+            probeIntent,
+            mainExecutor,
+            object : RecognitionSupportCallback {
+                override fun onSupportResult(recognitionSupport: RecognitionSupport) {
+                    if (!completed.compareAndSet(false, true)) return
+                    mainHandler.removeCallbacks(timeoutRunnable)
+                    runCatching { checker.destroy() }
+                    if (supportChecker === checker) supportChecker = null
+
+                    applyRecognitionSupportResult(recognitionSupport)
+                    onCompleted?.invoke(_state.value)
+                }
+
+                override fun onError(error: Int) {
+                    if (!completed.compareAndSet(false, true)) return
+                    mainHandler.removeCallbacks(timeoutRunnable)
+                    runCatching { checker.destroy() }
+                    if (supportChecker === checker) supportChecker = null
+
+                    if (error == SpeechRecognizer.ERROR_SERVER_DISCONNECTED) {
+                        onDeviceDisqualified = true
+                    }
+                    markSupportUnverified(error, targetLanguage)
+                    onCompleted?.invoke(_state.value)
+                }
+            }
+        )
+    }
+
+    @RequiresApi(Build.VERSION_CODES.TIRAMISU)
     internal fun applyRecognitionSupportResult(support: RecognitionSupport) {
         val installed = support.installedOnDeviceLanguages.map { it.lowercase(Locale.ROOT) }
         val supportedOnDevice = support.supportedOnDeviceLanguages.map { it.lowercase(Locale.ROOT) }
@@ -1049,27 +1071,10 @@ class VoiceRecognitionManager internal constructor(
         } ?: return false
 
         val intent = buildSupportCheckIntent(targetLocale)
-        val listener = object : ModelDownloadListener {
-            override fun onProgress(completedPercent: Int) {
-                _state.update { it.copy(modelDownloadStatus = "Downloading $targetLocale voice model: $completedPercent%") }
-            }
-
-            override fun onSuccess() {
-                _state.update { it.copy(modelDownloadStatus = "$targetLocale offline speech model installed.") }
-                refreshCapabilitiesAsync(language)
-            }
-
-            override fun onScheduled() {
-                _state.update { it.copy(modelDownloadStatus = "$targetLocale voice model download scheduled by system.") }
-            }
-
-            override fun onError(error: Int) {
-                _state.update {
-                    it.copy(
-                        modelDownloadStatus = "System download unavailable (code $error); open Voice Input Settings to install $targetLocale."
-                    )
-                }
-            }
+        val listener = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            createModelDownloadListenerApi34(targetLocale, language)
+        } else {
+            null
         }
 
         val launched = runCatching {
@@ -1082,6 +1087,33 @@ class VoiceRecognitionManager internal constructor(
             _state.update { it.copy(modelDownloadStatus = "Requested system download for $targetLocale voice model.") }
         }
         return launched
+    }
+
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
+    private fun createModelDownloadListenerApi34(
+        targetLocale: String,
+        language: SpeechLanguageOption
+    ): ModelDownloadListener = object : ModelDownloadListener {
+        override fun onProgress(completedPercent: Int) {
+            _state.update { it.copy(modelDownloadStatus = "Downloading $targetLocale voice model: $completedPercent%") }
+        }
+
+        override fun onSuccess() {
+            _state.update { it.copy(modelDownloadStatus = "$targetLocale offline speech model installed.") }
+            refreshCapabilitiesAsync(language)
+        }
+
+        override fun onScheduled() {
+            _state.update { it.copy(modelDownloadStatus = "$targetLocale voice model download scheduled by system.") }
+        }
+
+        override fun onError(error: Int) {
+            _state.update {
+                it.copy(
+                    modelDownloadStatus = "System download unavailable (code $error); open Voice Input Settings to install $targetLocale."
+                )
+            }
+        }
     }
 
     fun resolveLocaleTag(language: SpeechLanguageOption): String = when (language) {

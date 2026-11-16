@@ -323,7 +323,8 @@ class DeterministicCommandEngine {
         if (lower.contains("volume") || lower.contains("mute") || lower.contains("sound") ||
             lower.contains("awaaz") || lower.contains("shabdam") || input.contains("వాల్యూమ్") ||
             input.contains("आवाज़") || input.contains("वॉल्यूम") || input.contains("ஒலி") ||
-            input.contains("ಧ್ವನಿ") || input.contains("ശബ്ദം") || input.contains("വോളിയം")
+            input.contains("வால்யூம்") || input.contains("ಧ್ವನಿ") || input.contains("ವಾಲ್ಯೂಮ್") ||
+            input.contains("ശബ്ദം") || input.contains("വോളിയം")
         ) {
             val action = when {
                 lower.contains("mute") || lower.contains("band") -> "mute"

@@ -10,6 +10,8 @@ on:
 jobs:
   build-and-verify-apk:
     runs-on: ubuntu-latest
+    env:
+      RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
 
     steps:
       - name: Checkout repository
@@ -91,15 +93,17 @@ jobs:
 
       # Optional: builds minified R8 Release APK when persistent upload keystore secrets are configured.
       - name: Build and verify signed Release APK (optional)
-        if: ${{ secrets.RELEASE_KEYSTORE_BASE64 != '' }}
+        if: ${{ env.RELEASE_KEYSTORE_BASE64 != '' }}
         env:
-          RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
           STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
+          : "${STORE_PASSWORD:?Set STORE_PASSWORD when RELEASE_KEYSTORE_BASE64 is configured}"
+          : "${KEY_PASSWORD:?Set KEY_PASSWORD when RELEASE_KEYSTORE_BASE64 is configured}"
           SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
           KEYSTORE_PATH="$RUNNER_TEMP/phoneai-release.jks"
           printf '%s' "$RELEASE_KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE_PATH"
+          test -s "$KEYSTORE_PATH"
           export KEYSTORE_PATH
           if [ -x ./gradlew ]; then
             ./gradlew assembleRelease --stacktrace
@@ -113,7 +117,7 @@ jobs:
           sha256sum "$RELEASE_APK"
 
       - name: Upload Release APK artifact (optional)
-        if: ${{ secrets.RELEASE_KEYSTORE_BASE64 != '' }}
+        if: ${{ env.RELEASE_KEYSTORE_BASE64 != '' }}
         uses: actions/upload-artifact@v4
         with:
           name: ai-phone-commander-release-apk

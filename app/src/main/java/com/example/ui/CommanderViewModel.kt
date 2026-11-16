@@ -211,15 +211,17 @@ class CommanderViewModel(application: Application) : AndroidViewModel(applicatio
             writeSettingsGranted = writeSettings,
             screenCaptureReady = screenCapture,
             exactAlarmGranted = exactAlarm,
-            requestedPermissions = settings.value.requestedPermissions
+            requestedPermissions = settings.value.requestedPermissions + _permissionStatus.value.requestedPermissions
         )
     }
 
     fun markPermissionsRequested(permissions: List<String>) {
         if (permissions.isEmpty()) return
+        _permissionStatus.value = _permissionStatus.value.copy(
+            requestedPermissions = _permissionStatus.value.requestedPermissions + permissions
+        )
         viewModelScope.launch {
             container.preferences.markPermissionsRequested(permissions.toSet())
-            refreshPermissions()
         }
     }
 

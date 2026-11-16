@@ -9,6 +9,7 @@ import android.media.AudioManager
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.net.Uri
+import android.os.Build
 import android.provider.AlarmClock
 import android.provider.CalendarContract
 import android.provider.ContactsContract
@@ -1088,20 +1089,22 @@ class SearchFilesTool(
         }
 
         // 3. Query MediaStore Downloads (accessible without broad READ_EXTERNAL_STORAGE on API 29+)
-        runCatching {
-            val projection = arrayOf(MediaStore.MediaColumns.DISPLAY_NAME, MediaStore.MediaColumns.SIZE)
-            context.contentResolver.query(
-                MediaStore.Downloads.EXTERNAL_CONTENT_URI,
-                projection,
-                null,
-                null,
-                "${MediaStore.MediaColumns.DATE_MODIFIED} DESC"
-            )?.use { cursor ->
-                while (cursor.moveToNext() && found.size < 16) {
-                    val name = cursor.getString(0) ?: continue
-                    val size = cursor.getLong(1)
-                    if (query.isBlank() || name.lowercase().contains(query)) {
-                        found.add("$name (${size / 1024} KB, Downloads)")
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            runCatching {
+                val projection = arrayOf(MediaStore.MediaColumns.DISPLAY_NAME, MediaStore.MediaColumns.SIZE)
+                context.contentResolver.query(
+                    MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+                    projection,
+                    null,
+                    null,
+                    "${MediaStore.MediaColumns.DATE_MODIFIED} DESC"
+                )?.use { cursor ->
+                    while (cursor.moveToNext() && found.size < 16) {
+                        val name = cursor.getString(0) ?: continue
+                        val size = cursor.getLong(1)
+                        if (query.isBlank() || name.lowercase().contains(query)) {
+                            found.add("$name (${size / 1024} KB, Downloads)")
+                        }
                     }
                 }
             }

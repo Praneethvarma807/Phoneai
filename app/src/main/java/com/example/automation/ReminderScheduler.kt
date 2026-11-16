@@ -335,31 +335,33 @@ class ReminderReceiver : BroadcastReceiver() {
         val reminderId = intent.getLongExtra(ReminderScheduler.EXTRA_REMINDER_ID, -1L)
         if (reminderId <= 0L) return
 
-        val pendingResult = goAsync()
+        val pendingResult: PendingResult? = goAsync()
         CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
             try {
-                val db = CommanderDatabase.build(context.applicationContext)
-                val dao = db.localReminderDao()
-                when (action) {
-                    ReminderScheduler.ACTION_COMPLETE_REMINDER -> {
-                        dao.setCompleted(reminderId, true)
-                        ReminderScheduler(context).cancelReminder(reminderId)
-                    }
-                    ReminderScheduler.ACTION_FIRE_REMINDER -> {
-                        val existing = dao.getById(reminderId)
-                        if (existing != null && !existing.isCompleted) {
-                            ReminderScheduler.showReminderNotification(
-                                context = context,
-                                reminderId = existing.id,
-                                title = existing.title,
-                                notes = existing.notes,
-                                triggerAt = existing.triggerAtMillis
-                            )
+                runCatching {
+                    val db = CommanderDatabase.build(context.applicationContext)
+                    val dao = db.localReminderDao()
+                    when (action) {
+                        ReminderScheduler.ACTION_COMPLETE_REMINDER -> {
+                            dao.setCompleted(reminderId, true)
+                            ReminderScheduler(context).cancelReminder(reminderId)
+                        }
+                        ReminderScheduler.ACTION_FIRE_REMINDER -> {
+                            val existing = dao.getById(reminderId)
+                            if (existing != null && !existing.isCompleted) {
+                                ReminderScheduler.showReminderNotification(
+                                    context = context,
+                                    reminderId = existing.id,
+                                    title = existing.title,
+                                    notes = existing.notes,
+                                    triggerAt = existing.triggerAtMillis
+                                )
+                            }
                         }
                     }
                 }
             } finally {
-                pendingResult.finish()
+                pendingResult?.finish()
             }
         }
     }
@@ -393,13 +395,15 @@ class ReminderBootReceiver : BroadcastReceiver() {
         val action = intent?.action ?: return
         if (action !in SUPPORTED_ACTIONS) return
 
-        val pendingResult = goAsync()
+        val pendingResult: PendingResult? = goAsync()
         CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
             try {
-                val db = CommanderDatabase.build(context.applicationContext)
-                ReminderScheduler(context.applicationContext).rescheduleAllPending(db.localReminderDao())
+                runCatching {
+                    val db = CommanderDatabase.build(context.applicationContext)
+                    ReminderScheduler(context.applicationContext).rescheduleAllPending(db.localReminderDao())
+                }
             } finally {
-                pendingResult.finish()
+                pendingResult?.finish()
             }
         }
     }

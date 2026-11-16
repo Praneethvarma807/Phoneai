@@ -460,15 +460,22 @@ class WakeWordForegroundService : Service() {
         _events.emit(WakeWordEvent.Detected(transcript, note))
     }
 
-    private fun createRecorder(sampleRate: Int, bufferSize: Int): AudioRecord? = runCatching {
-        AudioRecord(
-            MediaRecorder.AudioSource.VOICE_RECOGNITION,
-            sampleRate,
-            AudioFormat.CHANNEL_IN_MONO,
-            AudioFormat.ENCODING_PCM_16BIT,
-            bufferSize
-        )
-    }.getOrNull()
+    private fun createRecorder(sampleRate: Int, bufferSize: Int): AudioRecord? {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            return null
+        }
+        return runCatching {
+            AudioRecord(
+                MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                sampleRate,
+                AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT,
+                bufferSize
+            )
+        }.getOrNull()
+    }
 
     private fun releaseAudioRecord() {
         runCatching { audioRecord?.stop() }
