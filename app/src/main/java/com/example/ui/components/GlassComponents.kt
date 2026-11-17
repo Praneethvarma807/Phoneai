@@ -3,12 +3,10 @@ package com.example.ui.components
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.core.Spring
-import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
-import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
@@ -29,17 +27,11 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.composed
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.unit.dp
 import com.example.domain.model.ExecutionStatus
 import com.example.ui.animations.rememberReducedMotion
@@ -147,32 +139,6 @@ fun StatusPill(
     }
 }
 
-fun Modifier.pressScaleFeedback(enabled: Boolean = true): Modifier = composed {
-    val reducedMotion = rememberReducedMotion()
-    var pressed by remember { mutableStateOf(false) }
-    val scale by animateFloatAsState(
-        targetValue = if (!enabled || reducedMotion || !pressed) 1f else 0.96f,
-        animationSpec = spring(dampingRatio = Spring.DampingRatioNoBouncy, stiffness = Spring.StiffnessMedium),
-        label = "press_scale"
-    )
-    this
-        .graphicsLayer {
-            scaleX = scale
-            scaleY = scale
-        }
-        .pointerInput(enabled) {
-            if (enabled) {
-                detectTapGestures(
-                    onPress = {
-                        pressed = true
-                        tryAwaitRelease()
-                        pressed = false
-                    }
-                )
-            }
-        }
-}
-
 fun statusColor(status: ExecutionStatus): Color = when (status) {
     ExecutionStatus.SUCCESS -> EmeraldSuccess
     ExecutionStatus.FAILED -> CrimsonAlert
@@ -180,4 +146,12 @@ fun statusColor(status: ExecutionStatus): Color = when (status) {
     ExecutionStatus.CONFIRMATION_REQUIRED -> NeuralViolet
     ExecutionStatus.UNSUPPORTED -> AmberWarning
     ExecutionStatus.CANCELLED -> ElectricCyan
+}
+
+fun sanitizeUiDiagnostics(text: String, developerMode: Boolean): String {
+    if (developerMode) return text
+    return text
+        .replace(Regex("\\s*\\((?:Error|code)\\s*\\d+\\)", RegexOption.IGNORE_CASE), "")
+        .replace(Regex("\\s*\\(HTTP\\s*\\d+[^)]*\\)", RegexOption.IGNORE_CASE), "")
+        .trim()
 }

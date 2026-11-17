@@ -23,7 +23,7 @@ import androidx.core.content.ContextCompat
 import com.example.CommanderApplication
 import com.example.MainActivity
 import com.example.R
-import com.example.data.preferences.CommanderSettings
+import com.example.domain.model.SpeechLanguageOption
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -38,6 +38,7 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 sealed interface WakeWordEvent {
     data class Detected(val transcript: String, val confidenceNote: String) : WakeWordEvent
@@ -74,6 +75,21 @@ internal class WakeWordLoopController(
     var consecutiveAudioInitFailures: Int = 0
         private set
 
+    var ttsCooldownUntilMs: Long = 0L
+        private set
+
+    fun onTtsSpeakingChanged(speaking: Boolean, nowMs: Long) {
+        if (!speaking) {
+            ttsCooldownUntilMs = maxOf(ttsCooldownUntilMs, nowMs + TTS_ECHO_COOLDOWN_MS)
+        }
+    }
+
+    fun canCaptureWakeAudio(nowMs: Long, isTtsSpeaking: Boolean): Boolean {
+        if (isTtsSpeaking) return false
+        if (nowMs < ttsCooldownUntilMs) return false
+        return !isInCooldown(nowMs)
+    }
+
     fun isInCooldown(nowMs: Long): Boolean = nowMs < cooldownUntilMs
 
     fun recordKwsDetection(nowMs: Long, cooldownMs: Long = WAKE_COOLDOWN_MS) {
@@ -81,7 +97,8 @@ internal class WakeWordLoopController(
         consecutiveSpeechErrors = 0
     }
 
-    fun canUseSpeechVerifier(nowMs: Long, isAppInForeground: Boolean): Boolean {
+    fun canUseSpeechVerifier(nowMs: Long, isAppInForeground: Boolean, isTtsSpeaking: Boolean = false): Boolean {
+        if (isTtsSpeaking || nowMs < ttsCooldownUntilMs) return false
         if (nowMs < cooldownUntilMs) return false
         if (nowMs < speechVerifierSuspendedUntilMs) return false
         // Android 11+ restricts microphone access for background SpeechRecognizer IPC calls
@@ -139,6 +156,7 @@ internal class WakeWordLoopController(
 
     companion object {
         const val WAKE_COOLDOWN_MS = 3_500L
+        const val TTS_ECHO_COOLDOWN_MS = 450L
         const val BASE_ERROR_BACKOFF_MS = 4_000L
         const val MAX_BACKOFF_MS = 60_000L
         const val VERIFIER_SUSPENSION_MS = 60_000L
@@ -147,17 +165,41 @@ internal class WakeWordLoopController(
     }
 }
 
+object VoiceConversationControl {
+    private val STOP_PHRASES = setOf(
+        "cancel", "stop", "stop listening", "buddy stop", "cancel listening",
+        "goodbye", "bye", "bye buddy", "never mind", "nevermind", "exit voice",
+        "ఆపు", "బంద్ చేయి", "aapu", "bandh chey",
+        "रुको", "बंद करो", "ruko", "band karo",
+        "நிறுத்து", "niruthu",
+        "ನಿಲ್ಲಿಸು", "nillisu",
+        "നിർത്തൂ", "nirthu"
+    )
+
+    fun isTerminationPhrase(rawInput: String): Boolean {
+        val cleaned = rawInput.trim().lowercase()
+            .replace(Regex("[.!?,।]+"), "")
+            .replace(Regex("\\s+"), " ")
+        if (cleaned.isBlank()) return false
+        return cleaned in STOP_PHRASES
+    }
+}
+
 class WakeWordForegroundService : Service() {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val audioLock = Any()
     private var monitorJob: Job? = null
     private var settingsCollectorJob: Job? = null
     private var audioRecord: AudioRecord? = null
+    private var audioEffectController: AudioEffectController? = null
     private var kwsClassifier: LiteRtKwsClassifier? = null
     private val loopController = WakeWordLoopController()
+    private val noiseFloorTracker = AudioSignalProcessor.NoiseFloorTracker()
 
     @Volatile
-    private var cachedSettings: CommanderSettings = CommanderSettings()
+    private var cachedSettings: com.example.data.preferences.CommanderSettings =
+        com.example.data.preferences.CommanderSettings()
 
     @Volatile
     private var loadedKwsPath: String = ""
@@ -168,6 +210,7 @@ class WakeWordForegroundService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        activeInstanceRef = java.lang.ref.WeakReference(this)
         kwsClassifier = LiteRtKwsClassifier(applicationContext)
     }
 
@@ -308,8 +351,20 @@ class WakeWordForegroundService : Service() {
                 }
 
                 loopController.recordAudioInitSuccess()
-                audioRecord = recorder
-                runCatching { recorder.startRecording() }.onFailure {
+                val startOk = synchronized(audioLock) {
+                    if (!_isRunning.value || _isPaused.value) {
+                        runCatching { recorder.release() }
+                        false
+                    } else {
+                        audioRecord = recorder
+                        val controller = AudioEffectController()
+                        val fxStatus = controller.attachToSession(recorder.audioSessionId)
+                        audioEffectController = controller
+                        _audioPipelineStatus.value = "${fxStatus.summaryLabel()} + Dual-VAD"
+                        runCatching { recorder.startRecording() }.isSuccess
+                    }
+                }
+                if (!startOk) {
                     releaseAudioRecord()
                     if (loopController.recordAudioInitFailure()) {
                         _events.emit(WakeWordEvent.Error("Wake Word stopped: unable to capture audio."))
@@ -320,40 +375,85 @@ class WakeWordForegroundService : Service() {
                     continue
                 }
 
-                val buffer = ShortArray(1600) // 100ms frames
-                val windowFloat = FloatArray(sampleRate) // 1s window for optional KWS model
+                val buffer = ShortArray(1600) // 100ms frames @ 16 kHz
+                val windowFloat = FloatArray(sampleRate) // 1s circular buffer
                 var windowCursor = 0
                 var voicedFrames = 0
 
                 try {
                     while (_isRunning.value && !_isPaused.value) {
-                        val read = recorder.read(buffer, 0, buffer.size)
+                        val activeRecorder = synchronized(audioLock) { audioRecord }
+                        val read = if (activeRecorder == null || activeRecorder.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
+                            -1
+                        } else {
+                            runCatching { activeRecorder.read(buffer, 0, buffer.size) }.getOrDefault(-1)
+                        }
                         if (read <= 0) {
-                            delay(50L)
+                            delay(60L)
                             continue
                         }
-                        val rms = WakeWordMatcher.computeFrameRms(buffer, read)
-                        _micLevel.value = (rms * 8f).coerceIn(0f, 1f)
+                        val processedFrame = AudioSignalProcessor.preprocessFrame(
+                            samples = buffer,
+                            count = read,
+                            noiseFloorTracker = noiseFloorTracker
+                        )
+                        val rms = AudioSignalProcessor.computeRms(processedFrame)
+                        _micLevel.value = (rms * 5f).coerceIn(0f, 1f)
 
                         // Lock-free cached settings read: zero DataStore I/O inside the real-time audio loop
                         val currentSettings = cachedSettings
                         val threshold = WakeWordMatcher.rmsThresholdForSensitivity(currentSettings.wakeWordSensitivity)
+                        val vadDecision = DualFeatureVad.evaluateFrame(
+                            frame = processedFrame,
+                            sampleRate = sampleRate,
+                            noiseFloorRms = noiseFloorTracker.estimatedFloorRms,
+                            sensitivity = currentSettings.wakeWordSensitivity
+                        )
 
-                        for (i in 0 until read) {
-                            windowFloat[windowCursor] = buffer[i] / 32768f
+                        for (i in 0 until processedFrame.size) {
+                            windowFloat[windowCursor] = processedFrame[i]
                             windowCursor = (windowCursor + 1) % windowFloat.size
                         }
 
                         val now = System.currentTimeMillis()
-                        if (loopController.isInCooldown(now)) continue
+                        if (!loopController.canCaptureWakeAudio(now, isTtsSpeaking)) {
+                            voicedFrames = 0
+                            _micLevel.value = 0f
+                            delay(120L)
+                            continue
+                        }
 
-                        if (rms >= threshold) {
+                        if (vadDecision.isSpeech && rms >= threshold * 0.85f) {
                             voicedFrames++
                         } else {
                             if (voicedFrames in 3..14) {
+                                // Linearize circular 1s audio buffer before speaker verification & KWS
+                                val orderedWindow = FloatArray(windowFloat.size)
+                                val tailLen = windowFloat.size - windowCursor
+                                System.arraycopy(windowFloat, windowCursor, orderedWindow, 0, tailLen)
+                                System.arraycopy(windowFloat, 0, orderedWindow, tailLen, windowCursor)
+
+                                // Stage: Primary Speaker Intelligence verification when enrolled & enabled
+                                if (currentSettings.primarySpeakerOnlyEnabled && currentSettings.hasPrimarySpeakerProfile) {
+                                    val profile = PrimarySpeakerProfile.fromJson(currentSettings.primarySpeakerEmbeddingJson)
+                                    val spkResult = PrimarySpeakerVerifier.verify(
+                                        rawPcm = orderedWindow,
+                                        profile = profile,
+                                        threshold = currentSettings.speakerVerificationThreshold,
+                                        enforcePrimarySpeaker = true,
+                                        sampleRate = sampleRate
+                                    )
+                                    _lastSpeakerVerificationNote.value = spkResult.reason
+                                    if (!spkResult.accepted) {
+                                        voicedFrames = 0
+                                        delay(220L)
+                                        continue
+                                    }
+                                }
+
                                 // Path A: Optional LiteRT .tflite KWS model (works foreground & background)
                                 val kwsScore = kwsClassifier?.takeIf { it.isModelLoaded }
-                                    ?.scoreAudioWindow(windowFloat)
+                                    ?.scoreAudioWindow(orderedWindow)
                                 if (kwsScore != null && kwsScore >= currentSettings.wakeWordSensitivity) {
                                     loopController.recordKwsDetection(now)
                                     triggerWakeWord("Hello Buddy", "LiteRT .tflite KWS (score=${"%.2f".format(kwsScore)})")
@@ -368,7 +468,7 @@ class WakeWordForegroundService : Service() {
                                         updateNotification("Waiting for \"Hello Buddy\" locally")
                                     }
                                 }
-                                if (loopController.canUseSpeechVerifier(now, inForeground)) {
+                                if (loopController.canUseSpeechVerifier(now, inForeground, isTtsSpeaking)) {
                                     releaseAudioRecord()
                                     val outcome = verifyPhraseViaOfflineRecognizer(
                                         container = container,
@@ -377,7 +477,7 @@ class WakeWordForegroundService : Service() {
                                     when (val decision = loopController.handleSpeechOutcome(System.currentTimeMillis(), outcome)) {
                                         is VerifierStepDecision.TriggerWake -> {
                                             warnedSuspension = false
-                                            triggerWakeWord(decision.transcript, "Local Acoustic VAD + Offline Speech Verifier")
+                                            triggerWakeWord(decision.transcript, "DSP + Dual-VAD + Speech Verifier")
                                         }
                                         VerifierStepDecision.ContinueCooldown -> Unit
                                         is VerifierStepDecision.SuspendedBackoff -> {
@@ -422,8 +522,11 @@ class WakeWordForegroundService : Service() {
             return SpeechVerificationOutcome.Skipped
         }
         val resultDeferred = kotlinx.coroutines.CompletableDeferred<SpeechVerificationOutcome>()
+        val wakeLanguage = cachedSettings.speechLanguage
+            .takeIf { it != SpeechLanguageOption.AUTO }
+            ?: SpeechLanguageOption.EN_IN
         voiceManager.startListening(
-            language = com.example.domain.model.SpeechLanguageOption.EN_IN,
+            language = wakeLanguage,
             onResult = { transcript ->
                 if (!resultDeferred.isCompleted) {
                     if (WakeWordMatcher.matchesTranscript(transcript, sensitivity)) {
@@ -478,9 +581,18 @@ class WakeWordForegroundService : Service() {
     }
 
     private fun releaseAudioRecord() {
-        runCatching { audioRecord?.stop() }
-        runCatching { audioRecord?.release() }
-        audioRecord = null
+        val (toRelease, effects) = synchronized(audioLock) {
+            val existing = audioRecord
+            val fx = audioEffectController
+            audioRecord = null
+            audioEffectController = null
+            existing to fx
+        }
+        runCatching { effects?.close() }
+        if (toRelease != null) {
+            runCatching { toRelease.stop() }
+            runCatching { toRelease.release() }
+        }
     }
 
     private fun stopWakeWordService(persistDisabled: Boolean) {
@@ -491,20 +603,25 @@ class WakeWordForegroundService : Service() {
         settingsCollectorJob?.cancel()
         releaseAudioRecord()
         if (persistDisabled) {
-            scope.launch {
+            val persistScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+            persistScope.launch {
                 runCatching {
                     (application as CommanderApplication).container.preferences.setWakeWordEnabled(false)
                 }
+                withContext(Dispatchers.Main) {
+                    finalizeServiceStop()
+                }
+                persistScope.cancel()
             }
+        } else {
+            finalizeServiceStop()
         }
+    }
+
+    private fun finalizeServiceStop() {
         if (foregroundStarted) {
             runCatching {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                    stopForeground(STOP_FOREGROUND_REMOVE)
-                } else {
-                    @Suppress("DEPRECATION")
-                    stopForeground(true)
-                }
+                stopForeground(STOP_FOREGROUND_REMOVE)
             }
             foregroundStarted = false
         }
@@ -520,6 +637,7 @@ class WakeWordForegroundService : Service() {
         settingsCollectorJob?.cancel()
         releaseAudioRecord()
         kwsClassifier?.close()
+        activeInstanceRef = null
         scope.cancel()
         super.onDestroy()
     }
@@ -567,7 +685,7 @@ class WakeWordForegroundService : Service() {
             .setContentText(statusText)
             .setOngoing(true)
             .setContentIntent(openAppIntent)
-            .addAction(0, "Stop Listening", pauseIntent)
+            .addAction(0, "Pause", pauseIntent)
             .addAction(0, "Stop Service", stopIntent)
             .build()
     }
@@ -580,6 +698,17 @@ class WakeWordForegroundService : Service() {
         const val ACTION_RESUME_LISTENING = "com.example.action.WAKE_RESUME"
         const val ACTION_STOP_SERVICE = "com.example.action.WAKE_STOP"
 
+        @Volatile
+        private var activeInstanceRef: java.lang.ref.WeakReference<WakeWordForegroundService>? = null
+
+        @Volatile
+        private var isTtsSpeaking: Boolean = false
+
+        fun setTtsSpeaking(speaking: Boolean) {
+            isTtsSpeaking = speaking
+            activeInstanceRef?.get()?.loopController?.onTtsSpeakingChanged(speaking, System.currentTimeMillis())
+        }
+
         private val _isRunning = MutableStateFlow(false)
         val isRunning: StateFlow<Boolean> = _isRunning.asStateFlow()
 
@@ -588,6 +717,12 @@ class WakeWordForegroundService : Service() {
 
         private val _micLevel = MutableStateFlow(0f)
         val micLevel: StateFlow<Float> = _micLevel.asStateFlow()
+
+        private val _lastSpeakerVerificationNote = MutableStateFlow<String?>(null)
+        val lastSpeakerVerificationNote: StateFlow<String?> = _lastSpeakerVerificationNote.asStateFlow()
+
+        private val _audioPipelineStatus = MutableStateFlow("DSP + Dual-VAD Ready")
+        val audioPipelineStatus: StateFlow<String> = _audioPipelineStatus.asStateFlow()
 
         private val _events = MutableSharedFlow<WakeWordEvent>(extraBufferCapacity = 8)
         val events: SharedFlow<WakeWordEvent> = _events.asSharedFlow()
@@ -613,6 +748,12 @@ class WakeWordForegroundService : Service() {
 
         fun pause(context: Context) {
             if (_isRunning.value) {
+                activeInstanceRef?.get()?.let { instance ->
+                    _isPaused.value = true
+                    instance.releaseAudioRecord()
+                    instance.updateNotification("Wake word paused (microphone free)")
+                    return
+                }
                 runCatching {
                     context.startService(Intent(context, WakeWordForegroundService::class.java).apply {
                         action = ACTION_PAUSE_LISTENING
@@ -625,6 +766,12 @@ class WakeWordForegroundService : Service() {
 
         fun resume(context: Context) {
             if (_isRunning.value) {
+                activeInstanceRef?.get()?.let { instance ->
+                    _isPaused.value = false
+                    instance.startMonitoringLoop()
+                    instance.updateNotification("Waiting for \"Hello Buddy\" locally")
+                    return
+                }
                 runCatching {
                     context.startService(Intent(context, WakeWordForegroundService::class.java).apply {
                         action = ACTION_RESUME_LISTENING

@@ -6,12 +6,17 @@ import com.example.ai.DeterministicCommandEngine
 import com.example.ai.DeviceCompatibilityManager
 import com.example.ai.LocalLlmEngine
 import com.example.ai.ModelDownloadManager
+import com.example.automation.AutomationEngine
 import com.example.automation.DocumentAccessManager
 import com.example.automation.ReminderScheduler
 import com.example.automation.ScreenUnderstandingManager
+import com.example.camera.CameraAiAnalyzer
 import com.example.data.local.CommanderDatabase
 import com.example.data.preferences.CommanderPreferences
+import com.example.memory.PersonalMemoryRepository
+import com.example.network.ConnectivityMonitor
 import com.example.tools.PhoneToolsFactory
+import com.example.tools.RunRoutineTool
 import com.example.tools.ToolRegistry
 import com.example.voice.VoiceOutputManager
 import com.example.voice.VoiceRecognitionManager
@@ -19,9 +24,13 @@ import com.example.voice.VoiceRecognitionManager
 class AppContainer(application: Application) {
     val database: CommanderDatabase by lazy { CommanderDatabase.build(application) }
     val preferences: CommanderPreferences by lazy { CommanderPreferences(application) }
+    val connectivityMonitor: ConnectivityMonitor by lazy { ConnectivityMonitor(application) }
     val reminderScheduler: ReminderScheduler by lazy { ReminderScheduler(application) }
     val documentAccessManager: DocumentAccessManager by lazy {
         DocumentAccessManager(context = application, preferences = preferences)
+    }
+    val personalMemoryRepository: PersonalMemoryRepository by lazy {
+        PersonalMemoryRepository(dao = database.personalMemoryDao())
     }
     val deviceCompatibilityManager: DeviceCompatibilityManager by lazy { DeviceCompatibilityManager(application) }
     val modelDownloadManager: ModelDownloadManager by lazy {
@@ -39,6 +48,12 @@ class AppContainer(application: Application) {
             localLlmEngine = localLlmEngine
         )
     }
+    val cameraAiAnalyzer: CameraAiAnalyzer by lazy {
+        CameraAiAnalyzer(
+            context = application,
+            localLlmEngine = localLlmEngine
+        )
+    }
     val toolRegistry: ToolRegistry by lazy {
         ToolRegistry().apply {
             registerAll(
@@ -48,10 +63,21 @@ class AppContainer(application: Application) {
                     reminderDao = database.localReminderDao(),
                     screenUnderstandingManager = screenUnderstandingManager,
                     reminderScheduler = reminderScheduler,
-                    documentAccessManager = documentAccessManager
+                    documentAccessManager = documentAccessManager,
+                    connectivityMonitor = connectivityMonitor,
+                    memoryRepository = personalMemoryRepository
                 )
             )
+            register(RunRoutineTool { automationEngine })
         }
+    }
+    val automationEngine: AutomationEngine by lazy {
+        AutomationEngine(
+            context = application,
+            routineDao = database.automationRoutineDao(),
+            logDao = database.routineExecutionLogDao(),
+            toolRegistry = toolRegistry
+        )
     }
     val voiceOutputManager: VoiceOutputManager by lazy { VoiceOutputManager(application) }
     val voiceRecognitionManager: VoiceRecognitionManager by lazy { VoiceRecognitionManager(application) }
@@ -62,7 +88,10 @@ class AppContainer(application: Application) {
             toolRegistry = toolRegistry,
             historyDao = database.commandHistoryDao(),
             preferences = preferences,
-            voiceOutput = voiceOutputManager
+            voiceOutput = voiceOutputManager,
+            personalMemoryRepository = personalMemoryRepository,
+            connectivityMonitor = connectivityMonitor,
+            automationEngine = automationEngine
         )
     }
 }
@@ -80,6 +109,8 @@ class CommanderApplication : Application() {
         container.localLlmEngine.shutdown()
         container.modelDownloadManager.shutdown()
         container.screenUnderstandingManager.close()
+        container.cameraAiAnalyzer.close()
+        container.connectivityMonitor.shutdown()
         container.voiceOutputManager.shutdown()
         container.voiceRecognitionManager.shutdown()
         super.onTerminate()

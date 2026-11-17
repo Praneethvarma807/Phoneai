@@ -10,6 +10,8 @@ import androidx.room.PrimaryKey
 import androidx.room.Query
 import androidx.room.Room
 import androidx.room.RoomDatabase
+import androidx.room.migration.Migration
+import androidx.sqlite.db.SupportSQLiteDatabase
 import kotlinx.coroutines.flow.Flow
 
 @Entity(tableName = "command_history")
@@ -154,14 +156,119 @@ interface DownloadedModelDao {
     suspend fun deleteById(modelId: String)
 }
 
+@Entity(tableName = "personal_memories")
+data class PersonalMemoryEntity(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    val memoryKey: String,
+    val category: String,
+    val summaryLabel: String,
+    val encryptedValue: String,
+    val isEncrypted: Boolean = true,
+    val createdAt: Long = System.currentTimeMillis(),
+    val updatedAt: Long = System.currentTimeMillis()
+)
+
+@Entity(tableName = "automation_routines")
+data class AutomationRoutineEntity(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    val name: String,
+    val description: String,
+    val voiceTriggers: String,
+    val stepsJson: String,
+    val scheduleHour: Int? = null,
+    val scheduleMinute: Int? = null,
+    val isEnabled: Boolean = true,
+    val requiresConfirmation: Boolean = false,
+    val isPreset: Boolean = false,
+    val lastExecutedAt: Long? = null,
+    val createdAt: Long = System.currentTimeMillis()
+)
+
+@Entity(tableName = "routine_execution_logs")
+data class RoutineExecutionLogEntity(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    val routineId: Long,
+    val routineName: String,
+    val triggerSource: String,
+    val status: String,
+    val summary: String,
+    val executedAt: Long = System.currentTimeMillis()
+)
+
+@Dao
+interface PersonalMemoryDao {
+    @Query("SELECT * FROM personal_memories ORDER BY updatedAt DESC")
+    fun observeAll(): Flow<List<PersonalMemoryEntity>>
+
+    @Query("SELECT * FROM personal_memories ORDER BY updatedAt DESC")
+    suspend fun getAllOnce(): List<PersonalMemoryEntity>
+
+    @Query("SELECT * FROM personal_memories WHERE memoryKey = :key LIMIT 1")
+    suspend fun getByKey(key: String): PersonalMemoryEntity?
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsert(memory: PersonalMemoryEntity): Long
+
+    @Query("DELETE FROM personal_memories WHERE id = :id")
+    suspend fun deleteById(id: Long)
+
+    @Query("DELETE FROM personal_memories WHERE memoryKey = :key")
+    suspend fun deleteByKey(key: String)
+
+    @Query("DELETE FROM personal_memories")
+    suspend fun clearAll()
+}
+
+@Dao
+interface AutomationRoutineDao {
+    @Query("SELECT * FROM automation_routines ORDER BY isPreset DESC, id ASC")
+    fun observeAll(): Flow<List<AutomationRoutineEntity>>
+
+    @Query("SELECT * FROM automation_routines ORDER BY isPreset DESC, id ASC")
+    suspend fun getAllOnce(): List<AutomationRoutineEntity>
+
+    @Query("SELECT * FROM automation_routines WHERE id = :id LIMIT 1")
+    suspend fun getById(id: Long): AutomationRoutineEntity?
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insert(routine: AutomationRoutineEntity): Long
+
+    @androidx.room.Update
+    suspend fun update(routine: AutomationRoutineEntity)
+
+    @Query("UPDATE automation_routines SET isEnabled = :enabled WHERE id = :id")
+    suspend fun setEnabled(id: Long, enabled: Boolean)
+
+    @Query("UPDATE automation_routines SET lastExecutedAt = :executedAt WHERE id = :id")
+    suspend fun markExecuted(id: Long, executedAt: Long)
+
+    @Query("DELETE FROM automation_routines WHERE id = :id")
+    suspend fun deleteById(id: Long)
+}
+
+@Dao
+interface RoutineExecutionLogDao {
+    @Query("SELECT * FROM routine_execution_logs ORDER BY executedAt DESC LIMIT :limit")
+    fun observeRecent(limit: Int = 30): Flow<List<RoutineExecutionLogEntity>>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insert(log: RoutineExecutionLogEntity): Long
+
+    @Query("DELETE FROM routine_execution_logs")
+    suspend fun clearAll()
+}
+
 @Database(
     entities = [
         CommandHistoryEntity::class,
         LocalNoteEntity::class,
         LocalReminderEntity::class,
-        DownloadedModelEntity::class
+        DownloadedModelEntity::class,
+        PersonalMemoryEntity::class,
+        AutomationRoutineEntity::class,
+        RoutineExecutionLogEntity::class
     ],
-    version = 1,
+    version = 2,
     exportSchema = false
 )
 abstract class CommanderDatabase : RoomDatabase() {
@@ -169,10 +276,63 @@ abstract class CommanderDatabase : RoomDatabase() {
     abstract fun localNoteDao(): LocalNoteDao
     abstract fun localReminderDao(): LocalReminderDao
     abstract fun downloadedModelDao(): DownloadedModelDao
+    abstract fun personalMemoryDao(): PersonalMemoryDao
+    abstract fun automationRoutineDao(): AutomationRoutineDao
+    abstract fun routineExecutionLogDao(): RoutineExecutionLogDao
 
     companion object {
         @Volatile
         private var instance: CommanderDatabase? = null
+
+        val MIGRATION_1_2: Migration = object : Migration(1, 2) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `personal_memories` (
+                        `id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                        `memoryKey` TEXT NOT NULL,
+                        `category` TEXT NOT NULL,
+                        `summaryLabel` TEXT NOT NULL,
+                        `encryptedValue` TEXT NOT NULL,
+                        `isEncrypted` INTEGER NOT NULL,
+                        `createdAt` INTEGER NOT NULL,
+                        `updatedAt` INTEGER NOT NULL
+                    )
+                    """.trimIndent()
+                )
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `automation_routines` (
+                        `id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                        `name` TEXT NOT NULL,
+                        `description` TEXT NOT NULL,
+                        `voiceTriggers` TEXT NOT NULL,
+                        `stepsJson` TEXT NOT NULL,
+                        `scheduleHour` INTEGER,
+                        `scheduleMinute` INTEGER,
+                        `isEnabled` INTEGER NOT NULL,
+                        `requiresConfirmation` INTEGER NOT NULL,
+                        `isPreset` INTEGER NOT NULL,
+                        `lastExecutedAt` INTEGER,
+                        `createdAt` INTEGER NOT NULL
+                    )
+                    """.trimIndent()
+                )
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `routine_execution_logs` (
+                        `id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                        `routineId` INTEGER NOT NULL,
+                        `routineName` TEXT NOT NULL,
+                        `triggerSource` TEXT NOT NULL,
+                        `status` TEXT NOT NULL,
+                        `summary` TEXT NOT NULL,
+                        `executedAt` INTEGER NOT NULL
+                    )
+                    """.trimIndent()
+                )
+            }
+        }
 
         fun build(context: Context): CommanderDatabase {
             val current = instance
@@ -186,7 +346,8 @@ abstract class CommanderDatabase : RoomDatabase() {
                         context.applicationContext,
                         CommanderDatabase::class.java,
                         "ai_phone_commander.db"
-                    ).fallbackToDestructiveMigration(dropAllTables = true)
+                    )
+                        .addMigrations(MIGRATION_1_2)
                         .build()
                         .also { instance = it }
                 }

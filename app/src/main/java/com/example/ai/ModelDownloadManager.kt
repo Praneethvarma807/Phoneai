@@ -2,6 +2,7 @@ package com.example.ai
 
 import android.content.Context
 import android.net.Uri
+import android.provider.OpenableColumns
 import com.example.data.local.DownloadedModelDao
 import com.example.data.local.DownloadedModelEntity
 import com.example.domain.model.LocalModelSpec
@@ -267,7 +268,15 @@ class ModelDownloadManager(
     suspend fun importLocalModel(uri: Uri, displayName: String? = null): Result<DownloadedModelEntity> =
         withContext(Dispatchers.IO) {
             runCatching {
-                val fileName = "custom_${System.currentTimeMillis()}.litertlm"
+                val resolvedName = resolveDisplayName(uri)
+                val ext = resolvedName?.substringAfterLast('.', "")?.lowercase().orEmpty()
+                if (ext.isNotEmpty() && ext !in ALLOWED_MODEL_EXTENSIONS) {
+                    throw IllegalArgumentException(
+                        "Unsupported file type '.$ext'. Select a .litertlm or .tflite local AI model file."
+                    )
+                }
+                val targetExt = if (ext in ALLOWED_MODEL_EXTENSIONS) ext else "litertlm"
+                val fileName = "custom_${System.currentTimeMillis()}.$targetExt"
                 val dest = File(modelsDir(), fileName)
                 context.contentResolver.openInputStream(uri)?.use { input ->
                     FileOutputStream(dest).use { output ->
@@ -284,7 +293,7 @@ class ModelDownloadManager(
                 val id = "local-${sha.take(10)}"
                 val entity = DownloadedModelEntity(
                     modelId = id,
-                    displayName = displayName ?: "Imported Local Model",
+                    displayName = displayName ?: resolvedName ?: "Imported Local Model",
                     fileName = fileName,
                     localPath = dest.absolutePath,
                     expectedSizeBytes = dest.length(),
@@ -297,6 +306,27 @@ class ModelDownloadManager(
                 entity
             }
         }
+
+    private fun resolveDisplayName(uri: Uri): String? {
+        runCatching {
+            context.contentResolver.query(
+                uri,
+                arrayOf(OpenableColumns.DISPLAY_NAME),
+                null,
+                null,
+                null
+            )?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val idx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                    if (idx >= 0) {
+                        val name = cursor.getString(idx)?.trim()
+                        if (!name.isNullOrBlank()) return name
+                    }
+                }
+            }
+        }
+        return uri.lastPathSegment?.substringAfterLast('/')?.takeIf { it.isNotBlank() }
+    }
 
     suspend fun validateInstalledModel(modelId: String): Result<String> = withContext(Dispatchers.IO) {
         runCatching {
@@ -403,6 +433,7 @@ class ModelDownloadManager(
     companion object {
         private const val MAX_RETRIES = 3
         internal const val MIN_MODEL_BYTES = 1_000_000L
+        private val ALLOWED_MODEL_EXTENSIONS = setOf("litertlm", "tflite", "bin", "task")
 
         private fun defaultClient(): OkHttpClient = OkHttpClient.Builder()
             .connectTimeout(30, TimeUnit.SECONDS)

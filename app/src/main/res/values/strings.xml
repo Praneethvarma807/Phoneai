@@ -8,4 +8,7 @@
     <string name="screen_capture_channel_description">Active briefly while capturing your screen locally for on-device OCR and explanation.</string>
     <string name="reminder_channel_name">Scheduled Reminders</string>
     <string name="reminder_channel_description">Alerts for reminders scheduled locally via AI Commander.</string>
+    <string name="routine_channel_name">Smart Automation Routines</string>
+    <string name="routine_channel_description">Status alerts when scheduled AI Commander routines execute.</string>
+    <string name="notification_listener_label">AI Commander Notification Intelligence</string>
 </resources>

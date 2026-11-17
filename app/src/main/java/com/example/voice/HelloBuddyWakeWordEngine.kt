@@ -26,15 +26,25 @@ object WakeWordMatcher {
         "halo buddy",
         "hello body",
         "hello badi",
+        "helo badi",
+        "halo badi",
+        "hello budy",
+        "helo budy",
         "ello buddy",
         "hello birdie",
         "hello buddie",
-        "హలో బడ్డీ"
+        "హలో బడ్డీ",
+        "హలో బడి",
+        "हेलो बडी",
+        "हेलो बड्डी",
+        "ஹலோ பட்டி",
+        "ಹಲೋ ಬಡ್ಡಿ",
+        "ഹലോ ബഡ്ഡി"
     )
 
     fun matchesTranscript(transcript: String, sensitivity: Float = 0.65f): Boolean {
         val normalized = transcript.lowercase()
-            .replace(Regex("[^a-z\\u0C00-\\u0C7F\\s]"), " ")
+            .replace(Regex("[^a-z\\u0900-\\u0D7F\\s]"), " ")
             .replace(Regex("\\s+"), " ")
             .trim()
         if (normalized.isBlank()) return false
@@ -53,6 +63,52 @@ object WakeWordMatcher {
             }
         }
         return false
+    }
+
+    /**
+     * Strips leading "Hello Buddy" wake phrase (across EN/TE/HI/TA/KN/ML scripts & phonetic variants)
+     * so inline commands like "Hello Buddy, open Chrome" execute immediately without a second prompt.
+     * Preserves original casing/punctuation of the remaining command.
+     */
+    fun stripWakeWordPrefix(transcript: String, sensitivity: Float = 0.65f): String {
+        val trimmed = transcript.trim()
+        if (trimmed.isEmpty()) return ""
+
+        // Strip optional conversational filler ("Hey ", "Ok ") immediately preceding wake phrase
+        val withoutInterjection = trimmed.replace(Regex("^(?i)(?:hey|ok|okay|hi)[,\\s]+"), "").trim()
+        val working = if (withoutInterjection.isNotEmpty()) withoutInterjection else trimmed
+
+        val normalizedWorking = working.lowercase()
+        for (variant in exactAndPhoneticVariants.sortedByDescending { it.length }) {
+            if (normalizedWorking == variant) return ""
+            if (normalizedWorking.startsWith(variant)) {
+                val remainder = working.substring(variant.length)
+                    .trimStart(',', ':', ';', '-', '–', '—', '.', '!', ' ', '\t')
+                    .trim()
+                return remainder
+            }
+        }
+
+        // Fuzzy 2-word prefix match ("helo badi, open youtube")
+        val tokens = working.split(Regex("\\s+"))
+        if (tokens.size >= 2) {
+            val clean0 = tokens[0].lowercase().replace(Regex("[^a-z\\u0900-\\u0D7F]"), "")
+            val clean1 = tokens[1].lowercase().replace(Regex("[^a-z\\u0900-\\u0D7F]"), "")
+            val pair = "$clean0 $clean1".trim()
+            val threshold = when {
+                sensitivity >= 0.8f -> 0.72f
+                sensitivity >= 0.5f -> 0.78f
+                else -> 0.86f
+            }
+            if (similarity(pair, "hello buddy") >= threshold) {
+                if (tokens.size == 2) return ""
+                return tokens.drop(2).joinToString(" ")
+                    .trimStart(',', ':', ';', '-', '–', '—', '.', '!', ' ', '\t')
+                    .trim()
+            }
+        }
+
+        return trimmed
     }
 
     fun computeFrameRms(samples: ShortArray, count: Int): Float {

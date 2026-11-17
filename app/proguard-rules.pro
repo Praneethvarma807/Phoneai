@@ -33,6 +33,14 @@
 # App Services, Workers, Receivers & AccessibilityService
 -keep public class com.example.automation.** { *; }
 -keep public class com.example.voice.** { *; }
+-keep public class com.example.notifications.** { *; }
+-keep public class com.example.memory.** { *; }
+-keep public class com.example.network.** { *; }
+-keep public class com.example.camera.** { *; }
+
+# CameraX Initializer & Lifecycle Providers
+-keep class androidx.camera.** { *; }
+-dontwarn androidx.camera.**
 
 # OkHttp / Coroutines clean warnings suppression
 -dontwarn okhttp3.**

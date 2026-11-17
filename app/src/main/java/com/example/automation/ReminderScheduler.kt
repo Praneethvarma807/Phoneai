@@ -399,8 +399,10 @@ class ReminderBootReceiver : BroadcastReceiver() {
         CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
             try {
                 runCatching {
-                    val db = CommanderDatabase.build(context.applicationContext)
-                    ReminderScheduler(context.applicationContext).rescheduleAllPending(db.localReminderDao())
+                    val appCtx = context.applicationContext
+                    val db = CommanderDatabase.build(appCtx)
+                    ReminderScheduler(appCtx).rescheduleAllPending(db.localReminderDao())
+                    (appCtx as? com.example.CommanderApplication)?.container?.automationEngine?.rescheduleAllEnabled()
                 }
             } finally {
                 pendingResult?.finish()

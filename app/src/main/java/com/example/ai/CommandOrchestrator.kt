@@ -1,19 +1,26 @@
 package com.example.ai
 
+import com.example.automation.AutomationEngine
 import com.example.data.local.CommandHistoryDao
 import com.example.data.local.CommandHistoryEntity
 import com.example.data.preferences.CommanderPreferences
 import com.example.domain.model.ActionCategory
 import com.example.domain.model.ActionPlan
 import com.example.domain.model.AppLanguage
+import com.example.domain.model.ConversationContextSnapshot
 import com.example.domain.model.ConversationTurn
 import com.example.domain.model.ExecutionStatus
 import com.example.domain.model.OrbState
 import com.example.domain.model.PendingConfirmation
 import com.example.domain.model.PipelineStage
+import com.example.domain.model.ToolCallRequest
 import com.example.domain.model.ToolResult
+import com.example.memory.PersonalMemoryRepository
+import com.example.network.ConnectivityMonitor
 import com.example.tools.ToolRegistry
+import com.example.voice.VoiceConversationControl
 import com.example.voice.VoiceOutputManager
+import com.example.voice.WakeWordMatcher
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -46,11 +53,23 @@ class CommandOrchestrator(
     private val toolRegistry: ToolRegistry,
     private val historyDao: CommandHistoryDao,
     private val preferences: CommanderPreferences,
-    private val voiceOutput: VoiceOutputManager
+    private val voiceOutput: VoiceOutputManager,
+    private val personalMemoryRepository: PersonalMemoryRepository? = null,
+    private val connectivityMonitor: ConnectivityMonitor? = null,
+    private val automationEngine: AutomationEngine? = null
 ) {
     private val json = Json { prettyPrint = true; ignoreUnknownKeys = true }
     private val executionGuard = AtomicBoolean(false)
     private val conversationHistory = ArrayDeque<ConversationTurn>(8)
+
+    @Volatile
+    private var contextSnapshot = ConversationContextSnapshot()
+
+    @Volatile
+    private var lastSucceededCommandNorm: String = ""
+
+    @Volatile
+    private var lastSucceededAtMs: Long = 0L
 
     private val _state = MutableStateFlow(ExecutionUiState())
     val state: StateFlow<ExecutionUiState> = _state.asStateFlow()
@@ -58,18 +77,35 @@ class CommandOrchestrator(
     suspend fun processCommand(
         rawCommand: String,
         inputLanguage: String = "AUTO",
+        allowDuplicate: Boolean = false,
         onComplete: (() -> Unit)? = null
     ) {
-        val command = rawCommand.trim()
-        if (command.isEmpty()) return
+        val trimmed = rawCommand.trim()
+        if (trimmed.isEmpty()) {
+            onComplete?.invoke()
+            return
+        }
+        val stripped = WakeWordMatcher.stripWakeWordPrefix(trimmed)
+        val command = if (stripped.isNotBlank()) stripped else trimmed
 
         // Prevent duplicate concurrent requests while an execution is active
         if (!executionGuard.compareAndSet(false, true)) {
+            onComplete?.invoke()
             return
         }
 
         try {
             val startedAt = System.currentTimeMillis()
+            val normalizedCmd = normalizeCommandKey(command)
+            if (!allowDuplicate &&
+                normalizedCmd.isNotBlank() &&
+                normalizedCmd == lastSucceededCommandNorm &&
+                (startedAt - lastSucceededAtMs) < DUPLICATE_COMMAND_COOLDOWN_MS
+            ) {
+                onComplete?.invoke()
+                return
+            }
+
             val settings = preferences.settings.first()
             val previousActiveLang = _state.value.activeConversationLanguage
             val detected = LanguageDetector.detect(
@@ -78,6 +114,22 @@ class CommandOrchestrator(
                 conversationActiveLanguage = previousActiveLang
             )
             val responseLang = detected.responseLanguage
+
+            if (VoiceConversationControl.isTerminationPhrase(command)) {
+                voiceOutput.stop()
+                _state.value = ExecutionUiState(
+                    isExecuting = false,
+                    orbState = OrbState.IDLE,
+                    pipelineStage = PipelineStage.COMPLETED,
+                    currentCommand = command,
+                    detectedLanguageBadge = detected.badgeLabel,
+                    activeConversationLanguage = responseLang,
+                    finalReply = "Voice session stopped.",
+                    finalStatus = ExecutionStatus.CANCELLED
+                )
+                onComplete?.invoke()
+                return
+            }
 
             recordTurn("user", command, detected.primaryLanguage)
 
@@ -90,10 +142,23 @@ class CommandOrchestrator(
                 activeConversationLanguage = responseLang
             )
 
-            // Stage 1: Understanding & Planning (Local LLM first if loaded & enabled, else Deterministic Engine)
+            val isOffline = settings.offlineStrictMode ||
+                (connectivityMonitor?.refresh()?.isOnline == false)
+
+            // Retrieve relevant personal memories (non-sensitive only) for AI context
+            val relevantMemories = if (settings.memoryInjectionEnabled) {
+                runCatching {
+                    personalMemoryRepository?.recallRelevant(command, limit = 4)
+                        ?.map { "${it.summaryLabel}: ${it.valueText}" }
+                        .orEmpty()
+                }.getOrDefault(emptyList())
+            } else {
+                emptyList()
+            }
+
+            // Stage 1: Understanding & Planning (Local LLM first if loaded & enabled, else Routine Trigger / Deterministic)
             val llmState = localLlmEngine.runtimeState.value
             var plan: ActionPlan? = null
-            var llmFailureReason: String? = null
 
             if (llmState.isReady && !settings.commandOnlyMode && !llmState.commandOnlyMode) {
                 _state.update { it.copy(orbState = OrbState.THINKING, pipelineStage = PipelineStage.PLANNING) }
@@ -101,32 +166,46 @@ class CommandOrchestrator(
                     userInput = command,
                     registeredTools = toolRegistry.registeredNames(),
                     languageInfo = detected,
-                    recentTurns = conversationHistory.toList()
+                    recentTurns = conversationHistory.toList(),
+                    memoryContext = relevantMemories,
+                    isOffline = isOffline
                 )
                 if (llmPlan.isSuccess) {
                     plan = llmPlan.getOrNull()
-                } else {
-                    llmFailureReason = llmPlan.exceptionOrNull()?.message
+                }
+            }
+
+            if (plan == null) {
+                val matchedRoutine = automationEngine?.matchVoiceTrigger(command)
+                if (matchedRoutine != null) {
+                    plan = ActionPlan(
+                        intent = "run_routine",
+                        interpretation = "Execute Smart Automation routine \"${matchedRoutine.name}\".",
+                        steps = listOf("Run routine steps sequentially", "Record routine log"),
+                        toolCalls = listOf(ToolCallRequest("run_routine", mapOf("routine_name" to matchedRoutine.name))),
+                        assistantReply = "Running ${matchedRoutine.name}.",
+                        engineUsed = "AUTOMATION_ENGINE",
+                        detectedLanguage = detected.badgeLabel,
+                        responseLanguage = responseLang.shortBadge
+                    )
                 }
             }
 
             if (plan == null) {
                 _state.update { it.copy(pipelineStage = PipelineStage.PLANNING) }
-                plan = deterministicEngine.parse(command, detected)
+                plan = deterministicEngine.parse(
+                    rawInput = command,
+                    languageInfo = detected,
+                    recentTurns = conversationHistory.toList(),
+                    contextSnapshot = contextSnapshot
+                )
             }
 
             if (plan == null) {
-                val message = buildString {
-                    if (detected.primaryLanguage == AppLanguage.UNSUPPORTED) {
-                        append(LanguageDetector.unsupportedMessage(AppLanguage.UNSUPPORTED, command))
-                    } else if (llmState.isReady && !settings.commandOnlyMode) {
-                        append(LanguageDetector.unsupportedMessage(responseLang, command))
-                        if (!llmFailureReason.isNullOrBlank()) {
-                            append(" ($llmFailureReason)")
-                        }
-                    } else {
-                        append(LanguageDetector.unsupportedMessage(responseLang, command))
-                    }
+                val message = if (detected.primaryLanguage == AppLanguage.UNSUPPORTED) {
+                    LanguageDetector.unsupportedMessage(AppLanguage.UNSUPPORTED, command)
+                } else {
+                    LanguageDetector.unsupportedMessage(responseLang, command)
                 }
                 finishWithStatus(
                     command = command,
@@ -150,13 +229,54 @@ class CommandOrchestrator(
                 return
             }
 
+            // Offline resilience guard for online-requiring browser/web searches
+            val requiresInternetTool = plan.toolCalls.any { it.tool == "web_search" || it.tool == "open_url" }
+            if (requiresInternetTool && isOffline) {
+                val offlineMsg = if (settings.offlineStrictMode) {
+                    "Offline Strict Mode is active, so web browsing/search is blocked. All local device controls, notes, reminders, OCR, and routines remain active."
+                } else {
+                    "Device is currently offline, so web pages cannot load. On-device commands, notes, reminders, memory, OCR, and routines work normally."
+                }
+                finishWithStatus(
+                    command = command,
+                    inputLanguage = detected.badgeLabel,
+                    responseLanguage = responseLang,
+                    plan = plan,
+                    results = emptyList(),
+                    status = ExecutionStatus.FAILED,
+                    summary = offlineMsg,
+                    startedAt = startedAt,
+                    speakResponse = settings.voiceResponseEnabled,
+                    onComplete = onComplete
+                )
+                return
+            }
+
+            // Confidence validation before device action execution
+            if (plan.toolCalls.isNotEmpty() && plan.confidence < MIN_EXECUTION_CONFIDENCE) {
+                val clarifyMsg = LanguageDetector.unsupportedMessage(responseLang, command)
+                finishWithStatus(
+                    command = command,
+                    inputLanguage = detected.badgeLabel,
+                    responseLanguage = responseLang,
+                    plan = plan.copy(toolCalls = emptyList(), assistantReply = clarifyMsg, silentExecution = false),
+                    results = emptyList(),
+                    status = ExecutionStatus.UNSUPPORTED,
+                    summary = clarifyMsg,
+                    startedAt = startedAt,
+                    speakResponse = settings.voiceResponseEnabled,
+                    onComplete = onComplete
+                )
+                return
+            }
+
             _state.update {
                 it.copy(
                     currentPlan = plan,
                     pipelineStage = PipelineStage.SELECTING_TOOLS
                 )
             }
-            delay(90L)
+            delay(if (plan.silentExecution) 20L else 90L)
 
             // Check if plan requires explicit user confirmation before executing sensitive steps
             val anyToolRequiresConfirmation = plan.toolCalls.any { call ->
@@ -164,7 +284,7 @@ class CommandOrchestrator(
             }
             if (plan.requiresConfirmation || anyToolRequiresConfirmation) {
                 val preview = plan.confirmationPrompt
-                    ?: "Confirm executing ${plan.toolCalls.joinToString { it.tool }} for \"$command\"?"
+                    ?: "Confirm running \"$command\"?"
                 _state.update {
                     it.copy(
                         isExecuting = false,
@@ -184,7 +304,11 @@ class CommandOrchestrator(
                 }
                 if (settings.voiceResponseEnabled) {
                     voiceOutput.setResponseLanguage(responseLang)
-                    voiceOutput.speak(preview)
+                    voiceOutput.speak(preview) {
+                        onComplete?.invoke()
+                    }
+                } else {
+                    onComplete?.invoke()
                 }
                 return
             }
@@ -197,8 +321,15 @@ class CommandOrchestrator(
     }
 
     suspend fun confirmPendingAction(onComplete: (() -> Unit)? = null) {
-        val pending = _state.value.pendingConfirmation ?: return
-        if (!executionGuard.compareAndSet(false, true)) return
+        val pending = _state.value.pendingConfirmation
+        if (pending == null) {
+            onComplete?.invoke()
+            return
+        }
+        if (!executionGuard.compareAndSet(false, true)) {
+            onComplete?.invoke()
+            return
+        }
         try {
             _state.update { it.copy(pendingConfirmation = null, isExecuting = true) }
             executePlan(
@@ -216,7 +347,11 @@ class CommandOrchestrator(
     }
 
     suspend fun cancelPendingAction(onComplete: (() -> Unit)? = null) {
-        val pending = _state.value.pendingConfirmation ?: return
+        val pending = _state.value.pendingConfirmation
+        if (pending == null) {
+            onComplete?.invoke()
+            return
+        }
         _state.update { it.copy(pendingConfirmation = null) }
         val settings = preferences.settings.first()
         finishWithStatus(
@@ -260,30 +395,32 @@ class CommandOrchestrator(
             results.add(result)
             _state.update { it.copy(stepResults = results.toList()) }
 
-            if (result.status != ExecutionStatus.SUCCESS) {
+            if (result.status == ExecutionStatus.SUCCESS) {
+                updateContextFromToolCall(plan.intent, call, result)
+            } else {
                 overallStatus = result.status
-                if (results.size > 1 && results.first().status == ExecutionStatus.SUCCESS && result.requiresAccessibility) {
-                    overallStatus = ExecutionStatus.SUCCESS
-                } else {
-                    break
-                }
+                break
             }
         }
 
         _state.update { it.copy(pipelineStage = PipelineStage.VERIFYING) }
-        delay(90L)
+        delay(if (plan.silentExecution) 15L else 90L)
 
+        val distinctMessages = results.map { it.message.trim() }.filter { it.isNotBlank() }.distinct()
         val summary = buildString {
-            if (results.isEmpty()) {
+            if (distinctMessages.isEmpty()) {
                 append(plan.assistantReply.ifBlank { "Done." })
             } else {
-                if (responseLanguage != AppLanguage.ENGLISH && plan.assistantReply.isNotBlank() && overallStatus == ExecutionStatus.SUCCESS) {
-                    append(plan.assistantReply).append(" ")
+                val joinedResults = distinctMessages.joinToString(" ")
+                val prefix = plan.assistantReply.trim()
+                if (responseLanguage != AppLanguage.ENGLISH &&
+                    prefix.isNotBlank() &&
+                    overallStatus == ExecutionStatus.SUCCESS &&
+                    !joinedResults.contains(prefix, ignoreCase = true)
+                ) {
+                    append(prefix).append(" ")
                 }
-                results.forEachIndexed { idx, res ->
-                    if (idx > 0) append(" ")
-                    append(res.message)
-                }
+                append(joinedResults)
             }
         }
 
@@ -298,6 +435,19 @@ class CommandOrchestrator(
             startedAt = startedAt,
             speakResponse = settings.voiceResponseEnabled,
             onComplete = onComplete
+        )
+    }
+
+    private fun updateContextFromToolCall(intent: String, call: ToolCallRequest, result: ToolResult) {
+        contextSnapshot = contextSnapshot.copy(
+            lastIntent = intent,
+            lastToolName = call.tool,
+            lastUrl = result.data["url"] ?: call.arguments["url"] ?: contextSnapshot.lastUrl,
+            lastQuery = call.arguments["query"] ?: contextSnapshot.lastQuery,
+            lastPackage = result.data["package"] ?: contextSnapshot.lastPackage,
+            lastAppName = call.arguments["app_name"] ?: contextSnapshot.lastAppName,
+            lastRecipient = call.arguments["recipient"] ?: call.arguments["to"] ?: contextSnapshot.lastRecipient,
+            lastExtractedText = result.data["extracted_text"] ?: contextSnapshot.lastExtractedText
         )
     }
 
@@ -319,6 +469,12 @@ class CommandOrchestrator(
             .joinToString("; ") { "${it.toolName}: ${it.message}" }
             .takeIf { it.isNotBlank() }
 
+        if (status == ExecutionStatus.SUCCESS) {
+            lastSucceededCommandNorm = normalizeCommandKey(command)
+            lastSucceededAtMs = System.currentTimeMillis()
+        }
+
+        contextSnapshot = contextSnapshot.copy(lastSummary = summary)
         recordTurn("assistant", summary, responseLanguage)
 
         historyDao.insert(
@@ -336,6 +492,21 @@ class CommandOrchestrator(
                 durationMs = duration
             )
         )
+
+        val silentSuccess = plan.silentExecution && status == ExecutionStatus.SUCCESS
+        if (silentSuccess) {
+            _state.update {
+                it.copy(
+                    isExecuting = false,
+                    orbState = OrbState.IDLE,
+                    pipelineStage = PipelineStage.IDLE,
+                    finalReply = "",
+                    finalStatus = ExecutionStatus.SUCCESS
+                )
+            }
+            onComplete?.invoke()
+            return
+        }
 
         val finalOrb = if (status == ExecutionStatus.SUCCESS) OrbState.SUCCESS else OrbState.ERROR
         val finalStage = if (status == ExecutionStatus.SUCCESS) PipelineStage.COMPLETED else PipelineStage.FAILED
@@ -372,5 +543,15 @@ class CommandOrchestrator(
 
     fun updateOrbState(orbState: OrbState) {
         _state.update { it.copy(orbState = orbState) }
+    }
+
+    private fun normalizeCommandKey(raw: String): String = raw.trim().lowercase()
+        .replace(Regex("[^a-z0-9\\u0900-\\u0D7F\\s]"), " ")
+        .replace(Regex("\\s+"), " ")
+        .trim()
+
+    companion object {
+        const val DUPLICATE_COMMAND_COOLDOWN_MS = 2_500L
+        const val MIN_EXECUTION_CONFIDENCE = 0.55f
     }
 }

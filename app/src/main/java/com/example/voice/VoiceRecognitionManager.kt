@@ -246,13 +246,14 @@ class VoiceRecognitionManager internal constructor(
     private val activeSessionId = AtomicLong(0L)
     private var recognizer: SpeechRecognizerHandle? = null
     private var supportChecker: SpeechRecognizerHandle? = null
+    private var activeDownloadRecognizer: SpeechRecognizerHandle? = null
     private var timerJob: Job? = null
     private var timeoutJob: Job? = null
     private var startedAtMs: Long = 0L
 
-    // Track whether the OEM/system on-device binder disconnected with Error 11/14 so we avoid looping into it
+    // Track temporary cooldown when OEM/system on-device binder disconnects with Error 11/14
     @Volatile
-    private var onDeviceDisqualified: Boolean = false
+    private var onDeviceDisqualifiedUntilMs: Long = 0L
 
     @Volatile
     private var rateLimitedUntilMs: Long = 0L
@@ -267,6 +268,17 @@ class VoiceRecognitionManager internal constructor(
         refreshCapabilitiesAsync()
     }
 
+    private fun isOnDeviceDisqualified(nowMs: Long = System.currentTimeMillis()): Boolean =
+        nowMs < onDeviceDisqualifiedUntilMs
+
+    private fun markOnDeviceTemporarilyDisqualified() {
+        onDeviceDisqualifiedUntilMs = System.currentTimeMillis() + ON_DEVICE_COOLDOWN_MS
+    }
+
+    fun resetTemporaryDisqualification() {
+        onDeviceDisqualifiedUntilMs = 0L
+    }
+
     fun isCurrentlyListening(): Boolean = _state.value.isListening || _state.value.isStarting
 
     fun isRateLimited(): Boolean = System.currentTimeMillis() < rateLimitedUntilMs
@@ -277,11 +289,12 @@ class VoiceRecognitionManager internal constructor(
         discoveredComponents = components
         val hasService = available || components.isNotEmpty()
         val rawOnDevice = factory.isOnDeviceRecognitionAvailable(appContext)
+        val onDeviceCoolingDown = isOnDeviceDisqualified()
         val hasNetwork = factory.hasInternetConnection(appContext)
         val existingMap = _state.value.languageSupportMap
 
         val effectiveBackend = when {
-            rawOnDevice && !onDeviceDisqualified -> RecognizerBackendMode.ON_DEVICE
+            rawOnDevice && !onDeviceCoolingDown -> RecognizerBackendMode.ON_DEVICE
             available -> RecognizerBackendMode.SYSTEM_DEFAULT
             components.isNotEmpty() -> RecognizerBackendMode.CUSTOM_SERVICE
             else -> RecognizerBackendMode.UNAVAILABLE
@@ -292,10 +305,10 @@ class VoiceRecognitionManager internal constructor(
         val warning = when {
             !hasService ->
                 "No Speech Recognition service is installed or enabled on this device. Install Google Speech Services or use text input."
-            onDeviceDisqualified && !hasNetwork ->
+            onDeviceCoolingDown && !hasNetwork ->
                 "On-device recognition service disconnected (Error 11) and no internet is available. Install offline language packs in Voice Settings or type your command."
-            onDeviceDisqualified ->
-                "On-device speech service disconnected; automatically using platform recognition service."
+            onDeviceCoolingDown ->
+                "On-device speech service disconnected; temporarily using platform recognition service."
             !rawOnDevice && !hasNetwork ->
                 "On-device offline speech pack was not verified by the OS. Connect to internet or install offline voice packs in Language Settings."
             !rawOnDevice ->
@@ -305,7 +318,7 @@ class VoiceRecognitionManager internal constructor(
 
         val updated = _state.value.copy(
             isRecognitionAvailable = hasService,
-            isOfflineRecognitionSupported = rawOnDevice && !onDeviceDisqualified,
+            isOfflineRecognitionSupported = rawOnDevice && !onDeviceCoolingDown,
             backendMode = effectiveBackend,
             servicePackageName = primaryPkg,
             discoveredServices = components.map { it.flattenToShortString() },
@@ -321,6 +334,7 @@ class VoiceRecognitionManager internal constructor(
         targetLanguage: SpeechLanguageOption = SpeechLanguageOption.AUTO,
         onCompleted: ((VoiceListeningState) -> Unit)? = null
     ) {
+        resetTemporaryDisqualification()
         val base = checkCapabilities()
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU || !base.isRecognitionAvailable) {
             onCompleted?.invoke(base)
@@ -329,7 +343,7 @@ class VoiceRecognitionManager internal constructor(
 
         runOnMain {
             val checker = when {
-                factory.isOnDeviceRecognitionAvailable(appContext) && !onDeviceDisqualified ->
+                factory.isOnDeviceRecognitionAvailable(appContext) && !isOnDeviceDisqualified() ->
                     factory.createOnDeviceRecognizer(appContext) ?: factory.createDefaultRecognizer(appContext)
                 else -> factory.createDefaultRecognizer(appContext)
                     ?: discoveredComponents.firstOrNull()?.let { factory.createComponentRecognizer(appContext, it) }
@@ -410,7 +424,7 @@ class VoiceRecognitionManager internal constructor(
                     if (supportChecker === checker) supportChecker = null
 
                     if (error == SpeechRecognizer.ERROR_SERVER_DISCONNECTED) {
-                        onDeviceDisqualified = true
+                        markOnDeviceTemporarilyDisqualified()
                     }
                     markSupportUnverified(error, targetLanguage)
                     onCompleted?.invoke(_state.value)
@@ -615,7 +629,7 @@ class VoiceRecognitionManager internal constructor(
         val isOfflineConfirmed = langSupport == LanguageSupportStatus.VERIFIED_OFFLINE
         val shouldTryOnDeviceFirst = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
             factory.isOnDeviceRecognitionAvailable(appContext) &&
-            !onDeviceDisqualified &&
+            !isOnDeviceDisqualified() &&
             langSupport != LanguageSupportStatus.VERIFIED_ONLINE_ONLY
 
         if (shouldTryOnDeviceFirst) {
@@ -690,7 +704,7 @@ class VoiceRecognitionManager internal constructor(
 
         if (handle == null) {
             if (spec.mode == RecognizerBackendMode.ON_DEVICE) {
-                onDeviceDisqualified = true
+                markOnDeviceTemporarilyDisqualified()
             }
             launchAttempt(
                 sessionId = sessionId,
@@ -733,12 +747,13 @@ class VoiceRecognitionManager internal constructor(
         } catch (_: Throwable) {
             destroyRecognizerInternal()
             if (spec.mode == RecognizerBackendMode.ON_DEVICE) {
-                onDeviceDisqualified = true
+                markOnDeviceTemporarilyDisqualified()
             }
-            // Single bounded fallback to next backend if available
+            // Bounded exponential backoff fallback to next backend if available
             if (attemptIndex + 1 < attempts.size) {
+                val backoffDelay = FALLBACK_RETRY_DELAY_MS * (1L shl attemptIndex.coerceAtMost(2))
                 scope.launch {
-                    delay(FALLBACK_RETRY_DELAY_MS)
+                    delay(backoffDelay)
                     if (sessionId == activeSessionId.get()) {
                         launchAttempt(
                             sessionId = sessionId,
@@ -839,14 +854,14 @@ class VoiceRecognitionManager internal constructor(
             if (error == SpeechRecognizer.ERROR_SERVER_DISCONNECTED &&
                 spec.mode == RecognizerBackendMode.ON_DEVICE
             ) {
-                onDeviceDisqualified = true
+                markOnDeviceTemporarilyDisqualified()
             }
 
             if (error == SpeechRecognizer.ERROR_TOO_MANY_REQUESTS) {
                 rateLimitedUntilMs = System.currentTimeMillis() + RATE_LIMIT_COOLDOWN_MS
             }
 
-            // Bounded fallback for binder disconnect / unsupported check / language pack unavailable
+            // Bounded exponential backoff fallback for binder disconnect / unsupported check / language pack unavailable
             val canFallbackBackend = error in FALLBACK_ELIGIBLE_ERRORS &&
                 attemptIndex + 1 < attempts.size
 
@@ -864,8 +879,9 @@ class VoiceRecognitionManager internal constructor(
                         }
                     )
                 }
+                val backoffDelay = FALLBACK_RETRY_DELAY_MS * (1L shl attemptIndex.coerceAtMost(2))
                 scope.launch {
-                    delay(FALLBACK_RETRY_DELAY_MS)
+                    delay(backoffDelay)
                     if (sessionId == activeSessionId.get()) {
                         launchAttempt(
                             sessionId = sessionId,
@@ -882,8 +898,8 @@ class VoiceRecognitionManager internal constructor(
                 return
             }
 
-            // Bounded 1-shot retry for ERROR_RECOGNIZER_BUSY
-            if (error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY && busyRetriesRemaining > 0) {
+            // Bounded 1-shot retry for transient busy / audio / network errors
+            if (error in TRANSIENT_RETRYABLE_ERRORS && busyRetriesRemaining > 0) {
                 destroyRecognizerInternal()
                 scope.launch {
                     delay(BUSY_RETRY_DELAY_MS)
@@ -1064,15 +1080,18 @@ class VoiceRecognitionManager internal constructor(
     fun triggerLanguageModelDownload(language: SpeechLanguageOption): Boolean {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return false
         val targetLocale = resolveLocaleTag(language)
+        runCatching { activeDownloadRecognizer?.destroy() }
+        activeDownloadRecognizer = null
         val downloader = when {
-            factory.isOnDeviceRecognitionAvailable(appContext) && !onDeviceDisqualified ->
+            factory.isOnDeviceRecognitionAvailable(appContext) && !isOnDeviceDisqualified() ->
                 factory.createOnDeviceRecognizer(appContext)
             else -> factory.createDefaultRecognizer(appContext)
         } ?: return false
+        activeDownloadRecognizer = downloader
 
         val intent = buildSupportCheckIntent(targetLocale)
         val listener = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            createModelDownloadListenerApi34(targetLocale, language)
+            createModelDownloadListenerApi34(targetLocale, language, downloader)
         } else {
             null
         }
@@ -1083,8 +1102,14 @@ class VoiceRecognitionManager internal constructor(
 
         if (!launched) {
             runCatching { downloader.destroy() }
+            if (activeDownloadRecognizer === downloader) activeDownloadRecognizer = null
         } else if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             _state.update { it.copy(modelDownloadStatus = "Requested system download for $targetLocale voice model.") }
+            scope.launch {
+                delay(1_500L)
+                runCatching { downloader.destroy() }
+                if (activeDownloadRecognizer === downloader) activeDownloadRecognizer = null
+            }
         }
         return launched
     }
@@ -1092,13 +1117,16 @@ class VoiceRecognitionManager internal constructor(
     @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     private fun createModelDownloadListenerApi34(
         targetLocale: String,
-        language: SpeechLanguageOption
+        language: SpeechLanguageOption,
+        downloader: SpeechRecognizerHandle
     ): ModelDownloadListener = object : ModelDownloadListener {
         override fun onProgress(completedPercent: Int) {
             _state.update { it.copy(modelDownloadStatus = "Downloading $targetLocale voice model: $completedPercent%") }
         }
 
         override fun onSuccess() {
+            runCatching { downloader.destroy() }
+            if (activeDownloadRecognizer === downloader) activeDownloadRecognizer = null
             _state.update { it.copy(modelDownloadStatus = "$targetLocale offline speech model installed.") }
             refreshCapabilitiesAsync(language)
         }
@@ -1108,6 +1136,8 @@ class VoiceRecognitionManager internal constructor(
         }
 
         override fun onError(error: Int) {
+            runCatching { downloader.destroy() }
+            if (activeDownloadRecognizer === downloader) activeDownloadRecognizer = null
             _state.update {
                 it.copy(
                     modelDownloadStatus = "System download unavailable (code $error); open Voice Input Settings to install $targetLocale."
@@ -1320,6 +1350,8 @@ class VoiceRecognitionManager internal constructor(
         runOnMain {
             runCatching { supportChecker?.destroy() }
             supportChecker = null
+            runCatching { activeDownloadRecognizer?.destroy() }
+            activeDownloadRecognizer = null
         }
         scope.cancel()
     }
@@ -1339,6 +1371,7 @@ class VoiceRecognitionManager internal constructor(
         private const val FALLBACK_RETRY_DELAY_MS = 240L
         private const val BUSY_RETRY_DELAY_MS = 300L
         private const val RATE_LIMIT_COOLDOWN_MS = 4_000L
+        private const val ON_DEVICE_COOLDOWN_MS = 120_000L
         private const val MAX_ATTEMPT_COUNT = 3
 
         private val FALLBACK_ELIGIBLE_ERRORS = setOf(
@@ -1347,6 +1380,13 @@ class VoiceRecognitionManager internal constructor(
             SpeechRecognizer.ERROR_LANGUAGE_UNAVAILABLE,
             SpeechRecognizer.ERROR_LANGUAGE_NOT_SUPPORTED,
             SpeechRecognizer.ERROR_CLIENT
+        )
+
+        private val TRANSIENT_RETRYABLE_ERRORS = setOf(
+            SpeechRecognizer.ERROR_RECOGNIZER_BUSY,
+            SpeechRecognizer.ERROR_AUDIO,
+            SpeechRecognizer.ERROR_NETWORK,
+            SpeechRecognizer.ERROR_NETWORK_TIMEOUT
         )
     }
 }

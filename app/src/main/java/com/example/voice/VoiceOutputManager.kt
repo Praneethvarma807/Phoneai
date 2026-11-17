@@ -48,6 +48,8 @@ class VoiceOutputManager(
 
     private var currentSpeed: Float = 1.0f
     private var currentVoiceName: String = ""
+    private var lastSpokenNormalized: String = ""
+    private var lastSpokenAtMs: Long = 0L
 
     private val progressListener = object : UtteranceProgressListener() {
         override fun onStart(utteranceId: String?) {
@@ -81,6 +83,7 @@ class VoiceOutputManager(
                     engine.setOnUtteranceProgressListener(progressListener)
                     refreshVoices()
                     _isReady.value = true
+                    configure(currentSpeed, currentVoiceName)
                 } else {
                     _isReady.value = false
                 }
@@ -120,9 +123,18 @@ class VoiceOutputManager(
 
     fun setResponseLanguage(language: AppLanguage): Boolean {
         val engine = tts ?: return false
-        if (!_isReady.value || currentVoiceName.isNotBlank()) return false
+        if (!_isReady.value) return false
 
         val primaryLocale = Locale.forLanguageTag(language.bcp47)
+        if (currentVoiceName.isNotBlank()) {
+            val savedVoice = _offlineVoices.value.firstOrNull { it.name == currentVoiceName }
+                ?: runCatching { engine.voices?.firstOrNull { it.name == currentVoiceName } }.getOrNull()
+            if (savedVoice != null && savedVoice.locale.language == primaryLocale.language) {
+                runCatching { engine.voice = savedVoice }
+                return true
+            }
+        }
+
         val candidates = listOf(
             primaryLocale,
             Locale.forLanguageTag(primaryLocale.language),
@@ -145,9 +157,39 @@ class VoiceOutputManager(
         return false
     }
 
+    internal fun sanitizeForSpeech(rawText: String): String {
+        val cleaned = rawText
+            .replace(Regex("\\s*\\((?:Error\\s+\\d+|code\\s+\\d+|hardwareKeystore=[^)]+)\\)", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("\\b(?:java|android|kotlin)\\.[a-zA-Z0-9_.]+Exception:?\\s*"), "")
+            .replace(Regex("https?://\\S+"), "link")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+        if (cleaned.length <= 280) return cleaned
+        val cut = cleaned.lastIndexOf('.', startIndex = 280)
+        return if (cut >= 120) cleaned.substring(0, cut + 1) else cleaned.take(277) + "..."
+    }
+
     fun speak(text: String, onDone: (() -> Unit)? = null) {
+        val spokenText = sanitizeForSpeech(text)
         val engine = tts
-        if (isShutdown || !_isReady.value || engine == null || text.isBlank()) {
+        if (isShutdown || !_isReady.value || engine == null || spokenText.isBlank()) {
+            onDone?.invoke()
+            return
+        }
+
+        val now = System.currentTimeMillis()
+        val normalized = spokenText.lowercase()
+        val isImmediateDuplicate = synchronized(stateLock) {
+            val dup = normalized == lastSpokenNormalized &&
+                (now - lastSpokenAtMs) < 1_500L &&
+                activeUtteranceId != null
+            if (!dup) {
+                lastSpokenNormalized = normalized
+                lastSpokenAtMs = now
+            }
+            dup
+        }
+        if (isImmediateDuplicate) {
             onDone?.invoke()
             return
         }
@@ -172,7 +214,7 @@ class VoiceOutputManager(
             putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, utteranceId)
         }
         val queueResult = runCatching {
-            engine.speak(text, TextToSpeech.QUEUE_FLUSH, params, utteranceId)
+            engine.speak(spokenText, TextToSpeech.QUEUE_FLUSH, params, utteranceId)
         }.getOrDefault(TextToSpeech.ERROR)
 
         if (queueResult == TextToSpeech.ERROR) {
@@ -189,6 +231,7 @@ class VoiceOutputManager(
         }
         runCatching { tts?.stop() }
         _isSpeaking.value = false
+        WakeWordForegroundService.setTtsSpeaking(false)
         stopSpeechPulse()
         if (callback != null) {
             dispatchCallback(callback)
@@ -201,6 +244,7 @@ class VoiceOutputManager(
         }
         if (!matchesCurrent) return
         _isSpeaking.value = true
+        WakeWordForegroundService.setTtsSpeaking(true)
         startSpeechPulse()
     }
 
@@ -230,6 +274,7 @@ class VoiceOutputManager(
             activeOnDone = null
         }
         _isSpeaking.value = false
+        WakeWordForegroundService.setTtsSpeaking(false)
         stopSpeechPulse()
         if (callbackToRun != null) {
             dispatchCallback(callbackToRun)
@@ -277,6 +322,7 @@ class VoiceOutputManager(
         }
         stopSpeechPulse()
         _isSpeaking.value = false
+        WakeWordForegroundService.setTtsSpeaking(false)
         _isReady.value = false
         runCatching { tts?.setOnUtteranceProgressListener(null) }
         runCatching { tts?.stop() }

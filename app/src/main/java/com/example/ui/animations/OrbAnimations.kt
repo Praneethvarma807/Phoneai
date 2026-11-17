@@ -39,6 +39,9 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Message
 import androidx.compose.material.icons.filled.Apps
+import androidx.compose.material.icons.filled.AutoAwesome
+import androidx.compose.material.icons.filled.Bookmark
+import androidx.compose.material.icons.filled.CameraAlt
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Description
@@ -46,6 +49,7 @@ import androidx.compose.material.icons.filled.Event
 import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.Language
 import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.filled.NotificationsActive
 import androidx.compose.material.icons.filled.Psychology
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
@@ -399,6 +403,10 @@ fun categoryIcon(category: ActionCategory) = when (category) {
     ActionCategory.VISION -> Icons.Default.Visibility
     ActionCategory.APP_LAUNCH -> Icons.Default.Apps
     ActionCategory.SYSTEM -> Icons.Default.Psychology
+    ActionCategory.MEMORY -> Icons.Default.Bookmark
+    ActionCategory.AUTOMATION -> Icons.Default.AutoAwesome
+    ActionCategory.NOTIFICATIONS -> Icons.Default.NotificationsActive
+    ActionCategory.CAMERA -> Icons.Default.CameraAlt
 }
 
 @Composable

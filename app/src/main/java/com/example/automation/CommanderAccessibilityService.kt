@@ -171,6 +171,15 @@ class CommanderAccessibilityService : AccessibilityService() {
 
     fun navigateBack(): Boolean = performGlobalAction(GLOBAL_ACTION_BACK)
 
+    fun navigateHome(): Boolean = performGlobalAction(GLOBAL_ACTION_HOME)
+
+    fun takeSystemScreenshot(): Boolean =
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P) {
+            performGlobalAction(GLOBAL_ACTION_TAKE_SCREENSHOT)
+        } else {
+            false
+        }
+
     companion object {
         private val _activeService = MutableStateFlow<CommanderAccessibilityService?>(null)
         val activeService: StateFlow<CommanderAccessibilityService?> = _activeService.asStateFlow()

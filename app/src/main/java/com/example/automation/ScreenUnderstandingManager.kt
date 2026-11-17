@@ -105,7 +105,7 @@ class ScreenUnderstandingManager(
                     sourceLabel = if (ocrText.isNotBlank()) {
                         "MediaProjection + On-Device ML Kit OCR"
                     } else {
-                        "MediaProjection Capture (No text recognized)"
+                        "MediaProjection Capture (No Latin text recognized)"
                     }
                 } finally {
                     if (!bitmap.isRecycled) {
@@ -135,9 +135,23 @@ class ScreenUnderstandingManager(
                 projectionFailed ->
                     "Screen capture session stopped or permission was revoked. Re-grant Screen Capture or enable Accessibility Service."
                 else ->
-                    "No readable text was found on screen. Grant Screen Capture permission or enable Accessibility Service."
+                    "No readable text was found on screen (on-device OCR reads Latin script unless Accessibility exposes screen text). Enable Accessibility Service or open readable text."
             }
             return@withContext Result.failure(IllegalStateException(msg))
+        }
+
+        val activePkg = accessibilitySnapshot?.packageName.orEmpty().lowercase()
+        val sensitivePackage = SENSITIVE_PACKAGE_KEYWORDS.any { activePkg.contains(it) }
+        val containsOtpOrSecret = com.example.memory.MemorySecurityHelper.containsForbiddenSecret(combinedText)
+        if (sensitivePackage || containsOtpOrSecret) {
+            return@withContext Result.success(
+                ScreenAnalysisReport(
+                    sourceUsed = sourceLabel.ifBlank { "Privacy-Guarded Screen Inspection" },
+                    extractedText = "[Sensitive banking, password, or OTP screen content withheld locally for your protection.]",
+                    explanation = "Detected potentially sensitive banking, authentication, or OTP content on screen${if (activePkg.isNotBlank()) " ($activePkg)" else ""}. Content was withheld and not stored.",
+                    suggestedActions = listOf("Navigate away from sensitive screen before scanning")
+                )
+            )
         }
 
         val suggestions = deriveSuggestedActions(combinedText, accessibilitySnapshot)
@@ -212,5 +226,12 @@ class ScreenUnderstandingManager(
 
     fun close() {
         runCatching { textRecognizer.close() }
+    }
+
+    companion object {
+        private val SENSITIVE_PACKAGE_KEYWORDS = listOf(
+            "bank", "pay", "wallet", "upi", "gpay", "phonepe", "paytm",
+            "auth", "authenticator", "keepass", "1password", "bitwarden", "lastpass"
+        )
     }
 }

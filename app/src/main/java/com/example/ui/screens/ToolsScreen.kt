@@ -21,6 +21,9 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AccessibilityNew
 import androidx.compose.material.icons.filled.AddAlert
+import androidx.compose.material.icons.filled.AutoAwesome
+import androidx.compose.material.icons.filled.Bookmark
+import androidx.compose.material.icons.filled.CameraAlt
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.CreateNewFolder
@@ -29,6 +32,7 @@ import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.NotificationsActive
 import androidx.compose.material.icons.filled.Screenshot
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material3.AlertDialog
@@ -70,10 +74,13 @@ import com.example.ui.theme.NeuralViolet
 fun ToolsScreen(
     viewModel: CommanderViewModel,
     onRequestScreenCapture: () -> Unit,
+    onNavigateToHub: (Int) -> Unit = {},
+    onNavigateToCamera: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
     val accessibilityActive by CommanderAccessibilityService.activeService.collectAsStateWithLifecycle()
+    val settings by viewModel.settings.collectAsStateWithLifecycle()
     val notes by viewModel.localNotes.collectAsStateWithLifecycle()
     val reminders by viewModel.localReminders.collectAsStateWithLifecycle()
     val authorizedDocs by viewModel.authorizedDocuments.collectAsStateWithLifecycle()
@@ -188,10 +195,54 @@ fun ToolsScreen(
             item {
                 Text("Automation & Tool Registry", style = MaterialTheme.typography.headlineMedium)
                 Text(
-                    text = "${viewModel.registeredToolSchemas.size} schema-validated Android tools ready for local planning.",
+                    text = "${viewModel.registeredToolSchemas.size} device actions ready.",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
+            }
+
+            item {
+                GlassCard(accentBorder = NeuralViolet.copy(alpha = 0.6f)) {
+                    Text("Assistant Hub", style = MaterialTheme.typography.titleMedium)
+                    Spacer(Modifier.height(8.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(
+                            onClick = onNavigateToCamera,
+                            modifier = Modifier.weight(1f).testTag("tools_open_camera_ai_button")
+                        ) {
+                            Icon(Icons.Default.CameraAlt, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(6.dp))
+                            Text("Camera AI", maxLines = 1)
+                        }
+                        OutlinedButton(
+                            onClick = { onNavigateToHub(1) },
+                            modifier = Modifier.weight(1f).testTag("tools_open_routines_button")
+                        ) {
+                            Icon(Icons.Default.AutoAwesome, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(6.dp))
+                            Text("Routines", maxLines = 1)
+                        }
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedButton(
+                            onClick = { onNavigateToHub(0) },
+                            modifier = Modifier.weight(1f).testTag("tools_open_memory_button")
+                        ) {
+                            Icon(Icons.Default.Bookmark, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(6.dp))
+                            Text("AI Memory", maxLines = 1)
+                        }
+                        OutlinedButton(
+                            onClick = { onNavigateToHub(2) },
+                            modifier = Modifier.weight(1f).testTag("tools_open_alerts_button")
+                        ) {
+                            Icon(Icons.Default.NotificationsActive, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(6.dp))
+                            Text("Notifications", maxLines = 1)
+                        }
+                    }
+                }
             }
 
             // Browser, Screen & SAF Document Controls
@@ -202,7 +253,7 @@ fun ToolsScreen(
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text("Browser, Screen & SAF Access", style = MaterialTheme.typography.titleMedium)
+                        Text("Screen & Files", style = MaterialTheme.typography.titleMedium)
                         StatusPill(
                             label = if (accessibilityActive != null) "ACTIVE" else "OFF",
                             color = if (accessibilityActive != null) EmeraldSuccess else AmberWarning,
@@ -211,7 +262,7 @@ fun ToolsScreen(
                     }
                     Spacer(Modifier.height(6.dp))
                     Text(
-                        text = "Accessibility reads visible text and interacts with UI controls. Document & folder pickers use zero-permission Storage Access Framework (SAF).",
+                        text = "Read screen text or select local files and folders securely.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -264,16 +315,16 @@ fun ToolsScreen(
                     ) {
                         Icon(Icons.Default.AddAlert, contentDescription = null, modifier = Modifier.size(18.dp))
                         Spacer(Modifier.width(6.dp))
-                        Text("Schedule Reminder (AlarmManager / WorkManager)")
+                        Text("Schedule Reminder")
                     }
                 }
             }
 
-            // SAF Authorized Documents & Folders
+            // Authorized Documents & Folders
             if (authorizedDocs.isNotEmpty()) {
                 item {
                     Text(
-                        text = "AUTHORIZED SAF FILES & FOLDERS",
+                        text = "AUTHORIZED FILES & FOLDERS",
                         style = MaterialTheme.typography.labelMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -288,7 +339,7 @@ fun ToolsScreen(
                             Column(modifier = Modifier.weight(1f)) {
                                 Text(doc.displayName, style = MaterialTheme.typography.titleSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
                                 Text(
-                                    text = if (doc.isTree) "Authorized SAF Folder" else "Authorized SAF File (${doc.mimeType})",
+                                    text = if (doc.isTree) "Folder" else "File",
                                     style = MaterialTheme.typography.labelSmall,
                                     color = ElectricCyan
                                 )
@@ -397,51 +448,46 @@ fun ToolsScreen(
                 }
             }
 
-            item {
-                Text(
-                    text = "REGISTERED TOOL SCHEMAS",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
+            if (settings.developerModeEnabled) {
+                item {
+                    Text(
+                        text = "AVAILABLE TOOLS",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
 
-            items(viewModel.registeredToolSchemas, key = { it.name }) { schema ->
-                GlassCard(contentPadding = PaddingValues(14.dp)) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text(
-                            text = schema.name,
-                            style = MaterialTheme.typography.titleSmall,
-                            fontWeight = FontWeight.Bold,
-                            color = ElectricCyan
-                        )
-                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                            if (schema.requiresConfirmation) {
-                                StatusPill(label = "CONFIRM GATE", color = NeuralViolet, icon = Icons.Default.Lock)
-                            } else {
-                                StatusPill(label = schema.category, color = EmeraldSuccess, icon = Icons.Default.Check)
+                items(viewModel.registeredToolSchemas, key = { it.name }) { schema ->
+                    GlassCard(contentPadding = PaddingValues(14.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = schema.name.replace('_', ' ').replaceFirstChar { it.uppercaseChar() },
+                                style = MaterialTheme.typography.titleSmall,
+                                fontWeight = FontWeight.Bold,
+                                color = ElectricCyan
+                            )
+                            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                if (schema.requiresConfirmation) {
+                                    StatusPill(label = "CONFIRMATION", color = NeuralViolet, icon = Icons.Default.Lock)
+                                } else {
+                                    StatusPill(label = schema.category, color = EmeraldSuccess, icon = Icons.Default.Check)
+                                }
                             }
                         }
-                    }
-                    Spacer(Modifier.height(4.dp))
-                    Text(schema.description, style = MaterialTheme.typography.bodySmall)
-                    if (schema.parameters.isNotEmpty()) {
                         Spacer(Modifier.height(4.dp))
-                        Text(
-                            text = "Params: ${schema.parameters}",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-                    if (schema.requiredPermissions.isNotEmpty()) {
-                        Text(
-                            text = "Permissions: ${schema.requiredPermissions.joinToString()}",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = AmberWarning
-                        )
+                        Text(schema.description, style = MaterialTheme.typography.bodySmall)
+                        if (schema.requiredPermissions.isNotEmpty()) {
+                            Spacer(Modifier.height(4.dp))
+                            Text(
+                                text = "Requires: ${schema.requiredPermissions.joinToString()}",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = AmberWarning
+                            )
+                        }
                     }
                 }
             }

@@ -45,8 +45,31 @@ enum class ActionCategory {
     MESSAGING,
     VISION,
     SYSTEM,
-    APP_LAUNCH
+    APP_LAUNCH,
+    MEMORY,
+    AUTOMATION,
+    NOTIFICATIONS,
+    CAMERA
 }
+
+data class NetworkStatusSnapshot(
+    val isOnline: Boolean = true,
+    val isValidated: Boolean = true,
+    val transportLabel: String = "Online",
+    val isMetered: Boolean = false
+)
+
+data class ConversationContextSnapshot(
+    val lastIntent: String? = null,
+    val lastToolName: String? = null,
+    val lastUrl: String? = null,
+    val lastQuery: String? = null,
+    val lastPackage: String? = null,
+    val lastAppName: String? = null,
+    val lastRecipient: String? = null,
+    val lastExtractedText: String? = null,
+    val lastSummary: String? = null
+)
 
 enum class AppLanguage(
     val bcp47: String,
@@ -103,7 +126,9 @@ data class ActionPlan(
     val assistantReply: String = "",
     val engineUsed: String = "DETERMINISTIC",
     val detectedLanguage: String = "EN",
-    val responseLanguage: String = "EN"
+    val responseLanguage: String = "EN",
+    val silentExecution: Boolean = false,
+    val confidence: Float = 1.0f
 )
 
 data class ToolResult(

@@ -190,7 +190,9 @@ class LocalLlmEngine(
         userInput: String,
         registeredTools: Set<String>,
         languageInfo: LanguageDetectionResult = LanguageDetector.detect(userInput),
-        recentTurns: List<ConversationTurn> = emptyList()
+        recentTurns: List<ConversationTurn> = emptyList(),
+        memoryContext: List<String> = emptyList(),
+        isOffline: Boolean = false
     ): Result<ActionPlan> = withContext(engineDispatcher) {
         mutex.withLock {
             val activeConversation = conversation
@@ -200,6 +202,15 @@ class LocalLlmEngine(
             isGenerating = true
             try {
                 val prompt = buildString {
+                    if (isOffline) {
+                        appendLine("Network status: OFFLINE. Prefer strictly on-device tools; do not select web_search.")
+                    }
+                    if (memoryContext.isNotEmpty()) {
+                        appendLine("Verified personal user preferences (non-sensitive local memory):")
+                        memoryContext.take(4).forEach { memo ->
+                            appendLine("- $memo")
+                        }
+                    }
                     if (recentTurns.isNotEmpty()) {
                         appendLine("Recent conversation context (preserve topic/language if relevant):")
                         recentTurns.takeLast(4).forEach { turn ->

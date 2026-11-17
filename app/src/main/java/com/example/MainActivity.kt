@@ -66,9 +66,12 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
+import androidx.navigation.toRoute
 import com.example.ui.CommanderViewModel
 import com.example.ui.animations.rememberReducedMotion
 import com.example.ui.components.SpaceBackdrop
+import com.example.ui.screens.AssistantHubScreen
+import com.example.ui.screens.CameraAssistantScreen
 import com.example.ui.screens.DashboardScreen
 import com.example.ui.screens.HistoryScreen
 import com.example.ui.screens.ModelsScreen
@@ -87,6 +90,8 @@ import kotlinx.serialization.Serializable
 @Serializable object ToolsRoute
 @Serializable object HistoryRoute
 @Serializable object SettingsRoute
+@Serializable data class AssistantHubRoute(val initialTab: Int = 0)
+@Serializable object CameraAiRoute
 
 private data class NavItem<T : Any>(
     val route: T,
@@ -278,7 +283,9 @@ fun CommanderAppShell(
                                 viewModel = viewModel,
                                 onRequestScreenCapture = triggerExplainScreen,
                                 onNavigateToModels = { navigateTab(ModelsRoute) },
-                                onNavigateToSettings = { navigateTab(SettingsRoute) }
+                                onNavigateToSettings = { navigateTab(SettingsRoute) },
+                                onNavigateToHub = { tab -> navController.navigate(AssistantHubRoute(tab)) },
+                                onNavigateToCamera = { navController.navigate(CameraAiRoute) }
                             )
                         }
                         composable<ModelsRoute> {
@@ -287,7 +294,9 @@ fun CommanderAppShell(
                         composable<ToolsRoute> {
                             ToolsScreen(
                                 viewModel = viewModel,
-                                onRequestScreenCapture = triggerExplainScreen
+                                onRequestScreenCapture = triggerExplainScreen,
+                                onNavigateToHub = { tab -> navController.navigate(AssistantHubRoute(tab)) },
+                                onNavigateToCamera = { navController.navigate(CameraAiRoute) }
                             )
                         }
                         composable<HistoryRoute> {
@@ -300,6 +309,20 @@ fun CommanderAppShell(
                             SettingsScreen(
                                 viewModel = viewModel,
                                 onRequestScreenCapture = requestScreenCapture
+                            )
+                        }
+                        composable<AssistantHubRoute> { entry ->
+                            val route = entry.toRoute<AssistantHubRoute>()
+                            AssistantHubScreen(
+                                viewModel = viewModel,
+                                initialTab = route.initialTab,
+                                onNavigateBack = { navController.popBackStack() }
+                            )
+                        }
+                        composable<CameraAiRoute> {
+                            CameraAssistantScreen(
+                                viewModel = viewModel,
+                                onNavigateBack = { navController.popBackStack() }
                             )
                         }
                     }

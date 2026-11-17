@@ -51,6 +51,7 @@ import com.example.domain.model.ModelInstallStatus
 import com.example.ui.CommanderViewModel
 import com.example.ui.components.GlassCard
 import com.example.ui.components.StatusPill
+import com.example.ui.components.sanitizeUiDiagnostics
 import com.example.ui.theme.AmberWarning
 import com.example.ui.theme.CrimsonAlert
 import com.example.ui.theme.ElectricCyan
@@ -95,13 +96,13 @@ fun ModelsScreen(
                     style = MaterialTheme.typography.headlineMedium
                 )
                 Text(
-                    text = "Public open-weight .litertlm models via LiteRT-LM. Zero API keys or cloud subscriptions.",
+                    text = "Download or import offline models.",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
 
-            // Device Compatibility Telemetry
+            // Device Compatibility Summary / Developer Telemetry
             item {
                 GlassCard(accentBorder = ElectricCyan.copy(alpha = 0.6f)) {
                     Row(
@@ -110,27 +111,50 @@ fun ModelsScreen(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Text("Device Compatibility", style = MaterialTheme.typography.titleMedium)
-                        StatusPill(label = compat.cpuAbi, color = ElectricCyan, icon = Icons.Default.Memory)
+                        StatusPill(
+                            label = if (settings.developerModeEnabled) {
+                                compat.cpuAbi
+                            } else if (compat.isArm64) {
+                                "Ready"
+                            } else {
+                                "Limited"
+                            },
+                            color = ElectricCyan,
+                            icon = Icons.Default.Memory
+                        )
                     }
                     Spacer(Modifier.height(8.dp))
-                    Text(
-                        text = "RAM: ${compat.availableRamMb} MB free / ${compat.totalRamMb} MB total",
-                        style = MaterialTheme.typography.bodyMedium
-                    )
-                    Text(
-                        text = "Storage: ${compat.availableStorageMb} MB free • Models using $modelStorageUsedMb MB",
-                        style = MaterialTheme.typography.bodyMedium
-                    )
-                    Text(
-                        text = "Hardware GPU/OpenCL: ${if (compat.supportsGpuAcceleration) "Detected" else "CPU fallback"}",
-                        style = MaterialTheme.typography.bodyMedium
-                    )
-                    Spacer(Modifier.height(6.dp))
-                    Text(
-                        text = "${compat.tier.label}: ${compat.tier.recommendation}",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = ElectricCyan
-                    )
+                    if (settings.developerModeEnabled) {
+                        Text(
+                            text = "RAM: ${compat.availableRamMb} MB free / ${compat.totalRamMb} MB total",
+                            style = MaterialTheme.typography.bodyMedium
+                        )
+                        Text(
+                            text = "Storage: ${compat.availableStorageMb} MB free • Models using $modelStorageUsedMb MB",
+                            style = MaterialTheme.typography.bodyMedium
+                        )
+                        Text(
+                            text = "Hardware GPU/OpenCL: ${if (compat.supportsGpuAcceleration) "Detected" else "CPU fallback"}",
+                            style = MaterialTheme.typography.bodyMedium
+                        )
+                        Spacer(Modifier.height(6.dp))
+                        Text(
+                            text = "${compat.tier.label}: ${compat.tier.recommendation}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = ElectricCyan
+                        )
+                    } else {
+                        Text(
+                            text = "Available storage: ${compat.availableStorageMb} MB • Models using $modelStorageUsedMb MB",
+                            style = MaterialTheme.typography.bodyMedium
+                        )
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            text = compat.tier.recommendation,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = ElectricCyan
+                        )
+                    }
                 }
             }
 
@@ -143,12 +167,13 @@ fun ModelsScreen(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
-                            Text("Active Inference Engine", style = MaterialTheme.typography.titleMedium)
+                            Text("Active Model", style = MaterialTheme.typography.titleMedium)
                             Text(
                                 text = when {
-                                    runtime.isLoading -> "Initializing ${runtime.loadedModelName ?: "model"}…"
-                                    runtime.isReady -> "${runtime.loadedModelName} (${runtime.backendUsed})"
-                                    else -> "Deterministic Command Engine (No LLM loaded)"
+                                    runtime.isLoading -> "Loading ${runtime.loadedModelName ?: "model"}…"
+                                    runtime.isReady && settings.developerModeEnabled -> "${runtime.loadedModelName} (${runtime.backendUsed})"
+                                    runtime.isReady -> "${runtime.loadedModelName} (Active)"
+                                    else -> "Command Engine (No model loaded)"
                                 },
                                 style = MaterialTheme.typography.bodyMedium,
                                 color = if (runtime.isReady) EmeraldSuccess else MaterialTheme.colorScheme.onSurfaceVariant
@@ -168,7 +193,11 @@ fun ModelsScreen(
 
                     runtime.error?.let { err ->
                         Spacer(Modifier.height(6.dp))
-                        Text(text = err, style = MaterialTheme.typography.bodySmall, color = CrimsonAlert)
+                        Text(
+                            text = sanitizeUiDiagnostics(err, settings.developerModeEnabled),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = CrimsonAlert
+                        )
                     }
 
                     Spacer(Modifier.height(10.dp))
@@ -180,7 +209,7 @@ fun ModelsScreen(
                         Column(modifier = Modifier.weight(1f)) {
                             Text("Command-Only Mode", style = MaterialTheme.typography.titleSmall)
                             Text(
-                                text = "Force zero-LLM deterministic matching for instant low-RAM execution.",
+                                text = "Use fast deterministic matching without loading an LLM.",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
@@ -240,8 +269,16 @@ fun ModelsScreen(
                                 color = ElectricCyan
                             )
                         }
+                        val friendlyStatus = when {
+                            isLoaded -> "Active"
+                            status == ModelInstallStatus.READY -> "Ready"
+                            status == ModelInstallStatus.DOWNLOADING -> "Downloading"
+                            status == ModelInstallStatus.PAUSED -> "Paused"
+                            status == ModelInstallStatus.FAILED || status == ModelInstallStatus.CORRUPTED -> "Retry Needed"
+                            else -> "Available"
+                        }
                         StatusPill(
-                            label = if (isLoaded) "ACTIVE" else status.name,
+                            label = friendlyStatus,
                             color = when {
                                 isLoaded -> EmeraldSuccess
                                 status == ModelInstallStatus.READY -> ElectricCyan
@@ -281,7 +318,11 @@ fun ModelsScreen(
 
                     progress?.error?.let { err ->
                         Spacer(Modifier.height(4.dp))
-                        Text(err, style = MaterialTheme.typography.bodySmall, color = CrimsonAlert)
+                        Text(
+                            text = sanitizeUiDiagnostics(err, settings.developerModeEnabled),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = CrimsonAlert
+                        )
                     }
 
                     Spacer(Modifier.height(10.dp))

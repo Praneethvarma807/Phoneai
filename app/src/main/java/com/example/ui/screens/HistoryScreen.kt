@@ -68,6 +68,7 @@ fun HistoryScreen(
     val scope = rememberCoroutineScope()
     val entries by viewModel.historyEntries.collectAsStateWithLifecycle()
     val query by viewModel.historySearch.collectAsStateWithLifecycle()
+    val settings by viewModel.settings.collectAsStateWithLifecycle()
     var showClearDialog by remember { mutableStateOf(false) }
 
     if (showClearDialog) {
@@ -75,7 +76,7 @@ fun HistoryScreen(
             onDismissRequest = { showClearDialog = false },
             containerColor = MidnightNavy,
             title = { Text("Clear Command History?") },
-            text = { Text("This removes all locally saved command logs from Room SQLite on your device.") },
+            text = { Text("This removes all saved command history from this device.") },
             confirmButton = {
                 Button(
                     onClick = {
@@ -112,7 +113,7 @@ fun HistoryScreen(
                 Column(modifier = Modifier.weight(1f)) {
                     Text("Command History", style = MaterialTheme.typography.headlineMedium)
                     Text(
-                        text = "Stored strictly on-device in Room SQLite (${entries.size} entries)",
+                        text = "${entries.size} saved on device",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -199,16 +200,13 @@ fun HistoryScreen(
                             }
                             Spacer(Modifier.height(6.dp))
                             Text(item.commandText, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-                            Text(
-                                text = "Engine: ${item.engineUsed} • Tools: ${item.selectedToolsJson}",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = ElectricCyan
-                            )
                             Spacer(Modifier.height(4.dp))
                             Text(item.resultSummary, style = MaterialTheme.typography.bodySmall)
-                            item.failureDetails?.let { fail ->
-                                Spacer(Modifier.height(4.dp))
-                                Text("Failure: $fail", style = MaterialTheme.typography.labelSmall, color = CrimsonAlert)
+                            if (settings.developerModeEnabled) {
+                                item.failureDetails?.let { fail ->
+                                    Spacer(Modifier.height(4.dp))
+                                    Text(fail, style = MaterialTheme.typography.labelSmall, color = CrimsonAlert)
+                                }
                             }
                             Spacer(Modifier.height(8.dp))
                             Row(

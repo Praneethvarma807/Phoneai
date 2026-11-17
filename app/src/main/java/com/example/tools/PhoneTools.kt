@@ -31,6 +31,81 @@ import com.example.domain.model.ToolSchemaInfo
 import java.net.URLEncoder
 import java.text.DateFormat
 import java.util.Date
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+
+internal sealed interface ContactLookupResult {
+    data class Matched(val displayName: String, val digits: String, val dialString: String) : ContactLookupResult
+    data class Ambiguous(val names: List<String>) : ContactLookupResult
+    data object NotFound : ContactLookupResult
+    data object PermissionMissing : ContactLookupResult
+}
+
+internal suspend fun resolveContactPhone(
+    context: Context,
+    rawQuery: String
+): ContactLookupResult = withContext(Dispatchers.IO) {
+    val trimmed = rawQuery.trim()
+    if (trimmed.isEmpty()) return@withContext ContactLookupResult.NotFound
+
+    if (!trimmed.any { it.isLetter() }) {
+        val dial = trimmed.filter { it.isDigit() || it == '+' }
+        val digits = trimmed.filter { it.isDigit() }
+        if (digits.length >= 7) {
+            return@withContext ContactLookupResult.Matched(trimmed, digits, dial)
+        }
+    }
+
+    if (ContextCompat.checkSelfPermission(context, Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED) {
+        return@withContext ContactLookupResult.PermissionMissing
+    }
+
+    val candidates = runCatching {
+        val projection = arrayOf(
+            ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
+            ContactsContract.CommonDataKinds.Phone.NUMBER
+        )
+        val rows = mutableListOf<Triple<String, String, String>>()
+        context.contentResolver.query(
+            ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+            projection,
+            "${ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME} LIKE ?",
+            arrayOf("%$trimmed%"),
+            "${ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME} ASC"
+        )?.use { cursor ->
+            while (cursor.moveToNext() && rows.size < 25) {
+                val name = cursor.getString(0)?.trim().orEmpty()
+                val rawNum = cursor.getString(1)?.trim().orEmpty()
+                val dial = rawNum.filter { it.isDigit() || it == '+' }
+                val digits = rawNum.filter { it.isDigit() }
+                if (digits.length >= 7) {
+                    rows.add(Triple(name.ifBlank { trimmed }, digits, dial))
+                }
+            }
+        }
+        rows.distinctBy { it.first.lowercase() to it.second }
+    }.getOrDefault(emptyList())
+
+    if (candidates.isEmpty()) return@withContext ContactLookupResult.NotFound
+
+    val exactMatches = candidates.filter { it.first.equals(trimmed, ignoreCase = true) }
+    if (exactMatches.size == 1) {
+        val m = exactMatches.first()
+        return@withContext ContactLookupResult.Matched(m.first, m.second, m.third)
+    }
+    if (candidates.size == 1) {
+        val m = candidates.first()
+        return@withContext ContactLookupResult.Matched(m.first, m.second, m.third)
+    }
+
+    val prefixMatches = candidates.filter { it.first.startsWith(trimmed, ignoreCase = true) }
+    if (prefixMatches.size == 1) {
+        val m = prefixMatches.first()
+        return@withContext ContactLookupResult.Matched(m.first, m.second, m.third)
+    }
+
+    ContactLookupResult.Ambiguous(candidates.map { it.first }.distinct().take(4))
+}
 
 object PhoneToolsFactory {
     fun createAll(
@@ -39,32 +114,54 @@ object PhoneToolsFactory {
         reminderDao: LocalReminderDao,
         screenUnderstandingManager: ScreenUnderstandingManager,
         reminderScheduler: ReminderScheduler = ReminderScheduler(context),
-        documentAccessManager: DocumentAccessManager? = null
-    ): List<CommanderTool> = listOf(
-        OpenAppTool(context),
-        CheckAppInstalledTool(context),
-        OpenUrlTool(context),
-        WebSearchTool(context),
-        BrowserNavigateTool(context),
-        BrowserClickTool(),
-        BrowserTypeTool(),
-        BrowserScrollTool(),
-        GetScreenTextTool(),
-        AnalyzeScreenshotTool(screenUnderstandingManager),
-        AdjustBrightnessTool(context),
-        AdjustVolumeTool(context),
-        OpenSettingsTool(context),
-        CreateReminderTool(reminderDao, reminderScheduler),
-        CreateCalendarEventTool(context),
-        SearchContactsTool(context),
-        ComposeSmsTool(context),
-        ComposeEmailTool(context),
-        SendWhatsAppDraftTool(context),
-        SearchFilesTool(context, documentAccessManager),
-        CreateNoteTool(noteDao),
-        SetAlarmTool(context),
-        OpenDownloadsTool(context)
-    )
+        documentAccessManager: DocumentAccessManager? = null,
+        connectivityMonitor: com.example.network.ConnectivityMonitor? = null,
+        memoryRepository: com.example.memory.PersonalMemoryRepository? = null,
+        automationEngine: com.example.automation.AutomationEngine? = null
+    ): List<CommanderTool> = buildList {
+        addAll(
+            listOf(
+                OpenAppTool(context),
+                CheckAppInstalledTool(context),
+                OpenUrlTool(context),
+                WebSearchTool(context),
+                BrowserNavigateTool(context),
+                BrowserClickTool(),
+                BrowserTypeTool(),
+                BrowserScrollTool(),
+                GetScreenTextTool(),
+                AnalyzeScreenshotTool(screenUnderstandingManager),
+                AdjustBrightnessTool(context),
+                AdjustVolumeTool(context),
+                OpenSettingsTool(context),
+                CreateReminderTool(reminderDao, reminderScheduler),
+                CreateCalendarEventTool(context),
+                SearchContactsTool(context),
+                ComposeSmsTool(context),
+                ComposeEmailTool(context),
+                SendWhatsAppDraftTool(context),
+                SearchFilesTool(context, documentAccessManager),
+                CreateNoteTool(noteDao),
+                SetAlarmTool(context),
+                OpenDownloadsTool(context),
+                ToggleFlashlightTool(context),
+                SetTimerTool(context),
+                GetBatteryStatusTool(context),
+                GetDeviceInfoTool(context),
+                GetNetworkStatusTool(context, connectivityMonitor),
+                DialPhoneNumberTool(context),
+                SummarizeNotificationsTool(context)
+            )
+        )
+        if (memoryRepository != null) {
+            add(SaveMemoryTool(memoryRepository))
+            add(RecallMemoryTool(memoryRepository))
+            add(ForgetMemoryTool(memoryRepository))
+        }
+        if (automationEngine != null) {
+            add(RunRoutineTool(automationEngine))
+        }
+    }
 }
 
 private fun Context.hasPermission(permission: String): Boolean =
@@ -82,19 +179,27 @@ private fun findAppPackageByName(context: Context, query: String): Pair<String, 
     val launcherIntent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
     val apps = pm.queryIntentActivities(launcherIntent, 0)
     val q = query.trim().lowercase()
+    if (q.isEmpty()) return null
 
     // Exact or alias matching first
     val aliases = mapOf(
-        "chrome" to listOf("chrome", "com.android.chrome"),
+        "chrome" to listOf("chrome", "google chrome", "com.android.chrome", "com.chrome.beta", "com.chrome.dev"),
         "youtube" to listOf("youtube", "com.google.android.youtube"),
         "gmail" to listOf("gmail", "com.google.android.gm"),
-        "whatsapp" to listOf("whatsapp", "com.whatsapp"),
-        "play store" to listOf("play store", "com.android.vending"),
+        "whatsapp" to listOf("whatsapp", "whatsapp business", "com.whatsapp", "com.whatsapp.w4b"),
+        "play store" to listOf("play store", "google play store", "com.android.vending"),
         "settings" to listOf("settings", "com.android.settings"),
         "camera" to listOf("camera"),
-        "maps" to listOf("maps", "com.google.android.apps.maps"),
-        "calculator" to listOf("calculator"),
-        "clock" to listOf("clock", "deskclock")
+        "maps" to listOf("maps", "google maps", "com.google.android.apps.maps"),
+        "calculator" to listOf("calculator", "com.google.android.calculator", "com.android.calculator2"),
+        "clock" to listOf("clock", "deskclock", "com.google.android.deskclock", "com.android.deskclock"),
+        "phone" to listOf("phone", "dialer", "com.google.android.dialer", "com.android.dialer"),
+        "messages" to listOf("messages", "com.google.android.apps.messaging", "com.android.messaging"),
+        "contacts" to listOf("contacts", "com.google.android.contacts", "com.android.contacts"),
+        "photos" to listOf("photos", "gallery", "com.google.android.apps.photos"),
+        "gallery" to listOf("gallery", "photos", "com.google.android.apps.photos"),
+        "calendar" to listOf("calendar", "com.google.android.calendar"),
+        "files" to listOf("files", "files by google", "com.google.android.apps.nbu.files")
     )
 
     val candidateTokens = aliases[q] ?: listOf(q)
@@ -107,6 +212,14 @@ private fun findAppPackageByName(context: Context, query: String): Pair<String, 
         if (exact != null) {
             return exact.activityInfo.packageName to exact.loadLabel(pm).toString()
         }
+    }
+
+    val startsWithMatch = apps.firstOrNull {
+        val label = it.loadLabel(pm).toString().lowercase()
+        label.startsWith(q)
+    }
+    if (startsWithMatch != null) {
+        return startsWithMatch.activityInfo.packageName to startsWithMatch.loadLabel(pm).toString()
     }
 
     val partial = apps.firstOrNull {
@@ -134,6 +247,21 @@ class OpenAppTool(private val context: Context) : CommanderTool {
     override suspend fun execute(arguments: Map<String, String>): ToolResult {
         val appName = arguments.getValue("app_name").trim()
         val match = findAppPackageByName(context, appName)
+        if (match == null && appName.equals("settings", ignoreCase = true)) {
+            val settingsIntent = Intent(Settings.ACTION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            if (settingsIntent.resolveActivity(context.packageManager) != null) {
+                context.startActivity(settingsIntent)
+                return ToolResult(
+                    toolName = schema.name,
+                    status = ExecutionStatus.SUCCESS,
+                    message = "Launched Settings.",
+                    verificationNote = "Settings.ACTION_SETTINGS started",
+                    data = mapOf("package" to "com.android.settings", "label" to "Settings"),
+                    category = category
+                )
+            }
+        }
+        val (pkg, resolvedLabel) = match
             ?: return ToolResult(
                 toolName = schema.name,
                 status = ExecutionStatus.FAILED,
@@ -141,7 +269,6 @@ class OpenAppTool(private val context: Context) : CommanderTool {
                 verificationNote = "PackageManager launcher query returned no match",
                 category = category
             )
-        val (pkg, resolvedLabel) = match
         val launchIntent = context.packageManager.getLaunchIntentForPackage(pkg)?.apply {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         } ?: return ToolResult(
@@ -277,15 +404,34 @@ class WebSearchTool(private val context: Context) : CommanderTool {
         val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         }
-        context.startActivity(intent)
-        return ToolResult(
-            toolName = schema.name,
-            status = ExecutionStatus.SUCCESS,
-            message = "Searching Google for \"$query\".",
-            verificationNote = "Verified browser search intent launched",
-            data = mapOf("url" to url),
-            category = category
-        )
+        if (intent.resolveActivity(context.packageManager) == null) {
+            return ToolResult(
+                toolName = schema.name,
+                status = ExecutionStatus.FAILED,
+                message = "No web browser app available to run search.",
+                verificationNote = "Web search ACTION_VIEW unresolved",
+                category = category
+            )
+        }
+        return runCatching {
+            context.startActivity(intent)
+            ToolResult(
+                toolName = schema.name,
+                status = ExecutionStatus.SUCCESS,
+                message = "Searching Google for \"$query\".",
+                verificationNote = "Verified browser search intent launched",
+                data = mapOf("url" to url),
+                category = category
+            )
+        }.getOrElse { err ->
+            ToolResult(
+                toolName = schema.name,
+                status = ExecutionStatus.FAILED,
+                message = "Unable to open browser search: ${err.message ?: "activity unavailable"}",
+                verificationNote = "startActivity threw exception",
+                category = category
+            )
+        }
     }
 }
 
@@ -293,10 +439,10 @@ class BrowserNavigateTool(private val context: Context) : CommanderTool {
     override val category = ActionCategory.BROWSER
     override val schema = ToolSchemaInfo(
         name = "browser_navigate",
-        description = "Navigate to a URL or go back in the browser.",
-        requiredPermissions = listOf("AccessibilityService (for back navigation)"),
+        description = "Navigate to a URL, go back, go to Home screen, or capture system screenshot.",
+        requiredPermissions = listOf("AccessibilityService (for back/screenshot)"),
         requiresConfirmation = false,
-        parameters = mapOf("action" to "back | url", "url" to "optional URL"),
+        parameters = mapOf("action" to "back | home | screenshot | url", "url" to "optional URL"),
         category = category.name
     )
 
@@ -319,6 +465,67 @@ class BrowserNavigateTool(private val context: Context) : CommanderTool {
                 message = if (ok) "Navigated back." else "Back navigation failed.",
                 verificationNote = "Accessibility GLOBAL_ACTION_BACK=$ok",
                 category = category
+            )
+        }
+        if (action == "home") {
+            val service = CommanderAccessibilityService.activeService.value
+            if (service != null && service.navigateHome()) {
+                return ToolResult(
+                    toolName = schema.name,
+                    status = ExecutionStatus.SUCCESS,
+                    message = "Navigated to home screen.",
+                    verificationNote = "Accessibility GLOBAL_ACTION_HOME=true",
+                    category = ActionCategory.SYSTEM
+                )
+            }
+            val homeIntent = Intent(Intent.ACTION_MAIN).apply {
+                addCategory(Intent.CATEGORY_HOME)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            if (homeIntent.resolveActivity(context.packageManager) != null) {
+                context.startActivity(homeIntent)
+                return ToolResult(
+                    toolName = schema.name,
+                    status = ExecutionStatus.SUCCESS,
+                    message = "Navigated to home screen.",
+                    verificationNote = "CATEGORY_HOME launcher intent started",
+                    category = ActionCategory.SYSTEM
+                )
+            }
+            return ToolResult(
+                toolName = schema.name,
+                status = ExecutionStatus.FAILED,
+                message = "Unable to navigate to home screen on this device.",
+                verificationNote = "No HOME launcher resolved",
+                category = ActionCategory.SYSTEM
+            )
+        }
+        if (action == "screenshot") {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) {
+                return ToolResult(
+                    toolName = schema.name,
+                    status = ExecutionStatus.UNSUPPORTED,
+                    message = "System screenshot global action requires Android 9 (API 28) or newer.",
+                    verificationNote = "SDK=${Build.VERSION.SDK_INT} < 28",
+                    category = ActionCategory.SYSTEM
+                )
+            }
+            val service = CommanderAccessibilityService.activeService.value
+                ?: return ToolResult(
+                    toolName = schema.name,
+                    status = ExecutionStatus.PERMISSION_REQUIRED,
+                    message = "Enable AI Commander Accessibility Service to take a system screenshot.",
+                    verificationNote = "AccessibilityService inactive for GLOBAL_ACTION_TAKE_SCREENSHOT",
+                    requiresAccessibility = true,
+                    category = ActionCategory.SYSTEM
+                )
+            val ok = service.takeSystemScreenshot()
+            return ToolResult(
+                toolName = schema.name,
+                status = if (ok) ExecutionStatus.SUCCESS else ExecutionStatus.FAILED,
+                message = if (ok) "Screenshot captured." else "System screenshot action failed.",
+                verificationNote = "Accessibility GLOBAL_ACTION_TAKE_SCREENSHOT=$ok",
+                category = ActionCategory.SYSTEM
             )
         }
         val url = arguments["url"].orEmpty()
@@ -660,7 +867,7 @@ class CreateReminderTool(
     override fun validate(arguments: Map<String, String>): String? =
         if (arguments["title"].isNullOrBlank()) "Missing reminder 'title'." else null
 
-    override suspend fun execute(arguments: Map<String, String>): ToolResult {
+    override suspend fun execute(arguments: Map<String, String>): ToolResult = withContext(Dispatchers.IO) {
         val title = arguments.getValue("title").trim()
         val notes = arguments["notes"]?.trim().orEmpty()
         val explicitTrigger = arguments["trigger_at_millis"]?.toLongOrNull()
@@ -681,7 +888,7 @@ class CreateReminderTool(
         }
         val mechLabel = scheduleResult?.mechanism?.label ?: "Room Only"
 
-        return ToolResult(
+        ToolResult(
             toolName = schema.name,
             status = ExecutionStatus.SUCCESS,
             message = "Scheduled reminder #$id: \"$title\" for $formattedTime.$notifNote",
@@ -758,9 +965,9 @@ class SearchContactsTool(private val context: Context) : CommanderTool {
         category = category.name
     )
 
-    override suspend fun execute(arguments: Map<String, String>): ToolResult {
+    override suspend fun execute(arguments: Map<String, String>): ToolResult = withContext(Dispatchers.IO) {
         if (!context.hasPermission(Manifest.permission.READ_CONTACTS)) {
-            return ToolResult(
+            return@withContext ToolResult(
                 toolName = schema.name,
                 status = ExecutionStatus.PERMISSION_REQUIRED,
                 message = "Contacts permission is required to look up contacts.",
@@ -791,7 +998,7 @@ class SearchContactsTool(private val context: Context) : CommanderTool {
                 matches.add("$name ($number)")
             }
         }
-        return ToolResult(
+        ToolResult(
             toolName = schema.name,
             status = ExecutionStatus.SUCCESS,
             message = if (matches.isEmpty()) "No contacts matched '$query'." else "Found ${matches.size} contact(s): ${matches.joinToString("; ")}",
@@ -814,9 +1021,39 @@ class ComposeSmsTool(private val context: Context) : CommanderTool {
     )
 
     override suspend fun execute(arguments: Map<String, String>): ToolResult {
-        val recipient = arguments["recipient"].orEmpty().trim()
+        val rawRecipient = arguments["recipient"].orEmpty().trim()
         val body = arguments["body"].orEmpty().trim()
-        val uri = Uri.parse("smsto:${Uri.encode(recipient)}")
+        if (rawRecipient.isBlank() && body.isBlank()) {
+            return ToolResult(
+                toolName = schema.name,
+                status = ExecutionStatus.FAILED,
+                message = "Provide a recipient or SMS message body before drafting.",
+                verificationNote = "Empty SMS arguments",
+                category = category
+            )
+        }
+
+        val resolved = resolveContactPhone(context, rawRecipient)
+        if (resolved is ContactLookupResult.Ambiguous) {
+            return ToolResult(
+                toolName = schema.name,
+                status = ExecutionStatus.FAILED,
+                message = "Multiple contacts match \"$rawRecipient\" (${resolved.names.joinToString(", ")}). Please use the full name or phone number.",
+                verificationNote = "Ambiguous SMS contact match",
+                category = category
+            )
+        }
+
+        val targetAddress = when (resolved) {
+            is ContactLookupResult.Matched -> resolved.dialString
+            else -> rawRecipient
+        }
+        val targetLabel = when (resolved) {
+            is ContactLookupResult.Matched -> resolved.displayName
+            else -> rawRecipient.ifBlank { "selected contact" }
+        }
+
+        val uri = Uri.parse("smsto:${Uri.encode(targetAddress)}")
         val intent = Intent(Intent.ACTION_SENDTO, uri).apply {
             putExtra("sms_body", body)
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
@@ -834,8 +1071,9 @@ class ComposeSmsTool(private val context: Context) : CommanderTool {
         return ToolResult(
             toolName = schema.name,
             status = ExecutionStatus.SUCCESS,
-            message = "Opened SMS draft for ${recipient.ifBlank { "selected contact" }}.",
+            message = "Opened SMS draft for $targetLabel.",
             verificationNote = "Draft opened in SMS app (user sends manually)",
+            data = mapOf("recipient_address" to targetAddress),
             category = category
         )
     }
@@ -924,7 +1162,21 @@ class SendWhatsAppDraftTool(private val context: Context) : CommanderTool {
                 category = category
             )
 
-        val resolvedDigits = resolveRecipientPhoneDigits(recipient)
+        val lookup = resolveContactPhone(context, recipient)
+        if (lookup is ContactLookupResult.Ambiguous) {
+            return ToolResult(
+                toolName = schema.name,
+                status = ExecutionStatus.FAILED,
+                message = "Multiple contacts match \"$recipient\" (${lookup.names.joinToString(", ")}). Say the full contact name or phone number.",
+                verificationNote = "Ambiguous WhatsApp contact match",
+                category = category
+            )
+        }
+
+        val resolvedDigits = when (lookup) {
+            is ContactLookupResult.Matched -> lookup.digits
+            else -> null
+        }
         if (resolvedDigits != null) {
             val encodedText = Uri.encode(msg)
             val waUri = if (msg.isNotBlank()) {
@@ -1005,35 +1257,11 @@ class SendWhatsAppDraftTool(private val context: Context) : CommanderTool {
         return null
     }
 
-    internal fun resolveRecipientPhoneDigits(recipient: String): String? {
-        if (recipient.isBlank()) return null
-        extractPhoneDigitsIfNumeric(recipient)?.let { return it }
-
-        if (!context.hasPermission(Manifest.permission.READ_CONTACTS)) {
-            return null
+    internal suspend fun resolveRecipientPhoneDigits(recipient: String): String? =
+        when (val res = resolveContactPhone(context, recipient)) {
+            is ContactLookupResult.Matched -> res.digits
+            else -> null
         }
-
-        return runCatching {
-            val projection = arrayOf(
-                ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
-                ContactsContract.CommonDataKinds.Phone.NUMBER
-            )
-            context.contentResolver.query(
-                ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
-                projection,
-                "${ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME} LIKE ?",
-                arrayOf("%$recipient%"),
-                "${ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME} ASC"
-            )?.use { cursor ->
-                while (cursor.moveToNext()) {
-                    val number = cursor.getString(1).orEmpty()
-                    val digits = extractPhoneDigitsIfNumeric(number)
-                    if (digits != null) return@runCatching digits
-                }
-                null
-            }
-        }.getOrNull()
-    }
 
     companion object {
         private val WHATSAPP_PACKAGES = listOf("com.whatsapp", "com.whatsapp.w4b")
@@ -1070,7 +1298,7 @@ class SearchFilesTool(
         category = category.name
     )
 
-    override suspend fun execute(arguments: Map<String, String>): ToolResult {
+    override suspend fun execute(arguments: Map<String, String>): ToolResult = withContext(Dispatchers.IO) {
         val query = arguments["query"].orEmpty().trim().lowercase()
         val found = mutableListOf<String>()
 
@@ -1123,7 +1351,7 @@ class SearchFilesTool(
             "Found ${found.size} document(s): ${found.joinToString(", ")}$revokedNote"
         }
 
-        return ToolResult(
+        ToolResult(
             toolName = schema.name,
             status = ExecutionStatus.SUCCESS,
             message = message,
@@ -1154,11 +1382,11 @@ class CreateNoteTool(private val noteDao: LocalNoteDao) : CommanderTool {
     override fun validate(arguments: Map<String, String>): String? =
         if (arguments["content"].isNullOrBlank() && arguments["title"].isNullOrBlank()) "Note content cannot be empty." else null
 
-    override suspend fun execute(arguments: Map<String, String>): ToolResult {
+    override suspend fun execute(arguments: Map<String, String>): ToolResult = withContext(Dispatchers.IO) {
         val content = arguments["content"].orEmpty().ifBlank { arguments["title"].orEmpty() }.trim()
         val title = arguments["title"].orEmpty().ifBlank { content.take(40) }.trim()
         val id = noteDao.insert(LocalNoteEntity(title = title, content = content))
-        return ToolResult(
+        ToolResult(
             toolName = schema.name,
             status = ExecutionStatus.SUCCESS,
             message = "Saved note \"$title\" locally.",
@@ -1204,7 +1432,7 @@ class SetAlarmTool(private val context: Context) : CommanderTool {
         return ToolResult(
             toolName = schema.name,
             status = ExecutionStatus.SUCCESS,
-            message = "Alarm set for %02d:%02d (%s).".format(hour, minute, label),
+            message = "Opened Clock to confirm alarm for %02d:%02d (%s).".format(hour, minute, label),
             verificationNote = "AlarmClock intent launched",
             category = category
         )

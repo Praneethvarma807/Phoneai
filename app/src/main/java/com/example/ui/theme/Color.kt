@@ -20,4 +20,3 @@ val AmberWarning = Color(0xFFF59E0B)
 
 val TextPrimary = Color(0xFFF1F5F9)
 val TextSecondary = Color(0xFF94A3B8)
-val TextMuted = Color(0xFF64748B)

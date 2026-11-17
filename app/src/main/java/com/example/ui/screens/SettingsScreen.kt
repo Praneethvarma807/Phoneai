@@ -54,6 +54,7 @@ import com.example.domain.model.SpeechLanguageOption
 import com.example.ui.CommanderViewModel
 import com.example.ui.components.GlassCard
 import com.example.ui.components.StatusPill
+import com.example.ui.components.sanitizeUiDiagnostics
 import com.example.ui.theme.AmberWarning
 import com.example.ui.theme.ElectricCyan
 import com.example.ui.theme.EmeraldSuccess
@@ -73,6 +74,9 @@ fun SettingsScreen(
     val voiceState by viewModel.voiceListeningState.collectAsStateWithLifecycle()
     val ttsVoices by viewModel.ttsVoices.collectAsStateWithLifecycle()
     val execState by viewModel.executionState.collectAsStateWithLifecycle()
+    val enrollmentBusy by viewModel.primarySpeakerEnrollmentBusy.collectAsStateWithLifecycle()
+    val speakerNote by viewModel.lastSpeakerVerificationNote.collectAsStateWithLifecycle()
+    val audioPipelineStatus by viewModel.audioPipelineStatus.collectAsStateWithLifecycle()
 
     var voiceMenuExpanded by remember { mutableStateOf(false) }
 
@@ -97,6 +101,12 @@ fun SettingsScreen(
         if (uri != null) viewModel.importKwsModel(uri)
     }
 
+    val enrollMicLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) viewModel.enrollPrimarySpeaker()
+    }
+
     fun isPermanentlyDenied(permission: String, granted: Boolean): Boolean {
         if (granted) return false
         val wasRequested = permission in permStatus.requestedPermissions
@@ -116,9 +126,9 @@ fun SettingsScreen(
             verticalArrangement = Arrangement.spacedBy(14.dp)
         ) {
             item {
-                Text("Wake Word, Voice & Permissions", style = MaterialTheme.typography.headlineMedium)
+                Text("Voice & Permissions", style = MaterialTheme.typography.headlineMedium)
                 Text(
-                    text = "Configure offline \"Hello Buddy\" detection, voice languages, and least-privilege permissions.",
+                    text = "Manage wake word, languages, smart privacy toggles, and app permissions.",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -135,7 +145,7 @@ fun SettingsScreen(
                         Column(modifier = Modifier.weight(1f)) {
                             Text("Wake Word: \"Hello Buddy\"", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
                             Text(
-                                text = "100% offline local detection (no cloud wake APIs)",
+                                text = "Offline background detection",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = ElectricCyan
                             )
@@ -179,7 +189,7 @@ fun SettingsScreen(
 
                     Spacer(Modifier.height(10.dp))
                     Text(
-                        text = "Sensitivity: ${(settings.wakeWordSensitivity * 100).toInt()}% (higher = easier trigger, lower = fewer false wake-ups)",
+                        text = "Sensitivity: ${(settings.wakeWordSensitivity * 100).toInt()}%",
                         style = MaterialTheme.typography.bodySmall
                     )
                     Slider(
@@ -191,22 +201,40 @@ fun SettingsScreen(
                     )
 
                     SettingSwitchRow(
-                        title = "Activation Chime Sound",
-                        subtitle = "Play a brief tone when \"Hello Buddy\" is detected",
+                        title = "Activation Chime",
+                        subtitle = "Play a tone when \"Hello Buddy\" is heard",
                         checked = settings.activationSoundEnabled,
                         onCheckedChange = { viewModel.setActivationSoundEnabled(it) }
                     )
                     SettingSwitchRow(
-                        title = "Voice Response (TTS)",
-                        subtitle = "Speak confirmations and command results aloud",
+                        title = "Voice Responses",
+                        subtitle = "Speak replies aloud",
                         checked = settings.voiceResponseEnabled,
                         onCheckedChange = { viewModel.setVoiceResponseEnabled(it) }
                     )
                     SettingSwitchRow(
-                        title = "Continuous Wake Listening",
-                        subtitle = "Automatically resume \"Hello Buddy\" listening after completing each command",
+                        title = "Follow-Up Listening",
+                        subtitle = "Listen for follow-up commands automatically",
                         checked = settings.continuousListeningEnabled,
                         onCheckedChange = { viewModel.setContinuousListeningEnabled(it) }
+                    )
+                    SettingSwitchRow(
+                        title = "Personal AI Memory",
+                        subtitle = "Remember saved preferences during planning",
+                        checked = settings.memoryInjectionEnabled,
+                        onCheckedChange = { viewModel.setMemoryInjectionEnabled(it) }
+                    )
+                    SettingSwitchRow(
+                        title = "Notification Digest",
+                        subtitle = "Summarize non-sensitive alerts locally",
+                        checked = settings.notificationIntelligenceEnabled,
+                        onCheckedChange = { viewModel.setNotificationIntelligenceEnabled(it) }
+                    )
+                    SettingSwitchRow(
+                        title = "Offline Strict Mode",
+                        subtitle = "Keep all actions strictly on-device",
+                        checked = settings.offlineStrictMode,
+                        onCheckedChange = { viewModel.setOfflineStrictMode(it) }
                     )
 
                     Spacer(Modifier.height(8.dp))
@@ -217,16 +245,110 @@ fun SettingsScreen(
                         Icon(Icons.Default.FolderOpen, contentDescription = null)
                         Spacer(Modifier.width(6.dp))
                         Text(
-                            if (settings.kwsModelPath.isBlank()) "Import Custom .tflite KWS Model (Optional)"
-                            else "Custom .tflite KWS Loaded"
+                            if (settings.kwsModelPath.isBlank()) "Import Custom Wake Word Model"
+                            else "Custom Wake Word Model Loaded"
                         )
                     }
-                    Spacer(Modifier.height(6.dp))
+                }
+            }
+
+            // Primary Speaker Intelligence Card
+            item {
+                GlassCard(
+                    accentBorder = if (settings.primarySpeakerOnlyEnabled) EmeraldSuccess.copy(alpha = 0.7f) else MaterialTheme.colorScheme.outline
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Primary Speaker Intelligence", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                            Text(
+                                text = "Reject TV, music & other voices with DSP noise suppression and Dual-VAD",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Switch(
+                            checked = settings.primarySpeakerOnlyEnabled,
+                            enabled = settings.hasPrimarySpeakerProfile,
+                            onCheckedChange = { viewModel.setPrimarySpeakerOnlyEnabled(it) },
+                            modifier = Modifier.testTag("primary_speaker_only_switch")
+                        )
+                    }
+
+                    Spacer(Modifier.height(8.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        StatusPill(
+                            label = if (settings.hasPrimarySpeakerProfile) "Voice Enrolled (${settings.primarySpeakerSamplesCount}x)" else "Not Enrolled",
+                            color = if (settings.hasPrimarySpeakerProfile) EmeraldSuccess else AmberWarning,
+                            icon = Icons.Default.RecordVoiceOver
+                        )
+                        StatusPill(
+                            label = audioPipelineStatus,
+                            color = ElectricCyan
+                        )
+                    }
+
+                    if (!speakerNote.isNullOrBlank()) {
+                        Spacer(Modifier.height(6.dp))
+                        Text(
+                            text = speakerNote!!,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = ElectricCyan
+                        )
+                    }
+
+                    Spacer(Modifier.height(10.dp))
                     Text(
-                        text = "Battery & Background Note: Wake word listening runs in an explicit foreground service with a persistent notification. Audio stays in RAM and is never recorded to disk or uploaded.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                        text = "Speaker Match Strictness: ${(settings.speakerVerificationThreshold * 100).toInt()}%",
+                        style = MaterialTheme.typography.bodySmall
                     )
+                    Slider(
+                        value = settings.speakerVerificationThreshold,
+                        onValueChange = { viewModel.setSpeakerVerificationThreshold(it) },
+                        valueRange = 0.55f..0.90f,
+                        colors = SliderDefaults.colors(thumbColor = EmeraldSuccess, activeTrackColor = EmeraldSuccess),
+                        modifier = Modifier.testTag("speaker_threshold_slider")
+                    )
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Button(
+                            onClick = {
+                                if (permStatus.microphoneGranted) {
+                                    viewModel.enrollPrimarySpeaker()
+                                } else {
+                                    enrollMicLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                                }
+                            },
+                            enabled = !enrollmentBusy,
+                            modifier = Modifier
+                                .weight(1f)
+                                .testTag("enroll_primary_speaker_button")
+                        ) {
+                            Icon(Icons.Default.Mic, contentDescription = null)
+                            Spacer(Modifier.width(6.dp))
+                            Text(
+                                when {
+                                    enrollmentBusy -> "Listening (2s)…"
+                                    settings.hasPrimarySpeakerProfile -> "Re-Enroll Voice"
+                                    else -> "Enroll My Voice"
+                                }
+                            )
+                        }
+                        if (settings.hasPrimarySpeakerProfile) {
+                            OutlinedButton(
+                                onClick = { viewModel.clearPrimarySpeakerProfile() },
+                                modifier = Modifier.testTag("clear_speaker_profile_button")
+                            ) {
+                                Text("Clear")
+                            }
+                        }
+                    }
                 }
             }
 
@@ -253,14 +375,20 @@ fun SettingsScreen(
                     }
                     Spacer(Modifier.height(6.dp))
                     Text(
-                        text = "Auto mode detects English (IN/US), Telugu, Hindi, Tamil, Kannada, Malayalam & mixed-language speech/text dynamically.",
+                        text = "Auto supports English, Telugu, Hindi, Tamil, Kannada, Malayalam, and mixed speech.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                     Spacer(Modifier.height(6.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         StatusPill(
-                            label = "Engine: ${voiceState.backendMode.label}",
+                            label = if (settings.developerModeEnabled) {
+                                voiceState.backendMode.label
+                            } else if (voiceState.isRecognitionAvailable) {
+                                "Voice Ready"
+                            } else {
+                                "Voice Setup Needed"
+                            },
                             color = if (voiceState.isRecognitionAvailable) EmeraldSuccess else AmberWarning
                         )
                         val selectedSupport = if (settings.speechLanguage == SpeechLanguageOption.AUTO) {
@@ -268,7 +396,7 @@ fun SettingsScreen(
                         } else {
                             voiceState.languageSupportMap[settings.speechLanguage.code]
                         }
-                        if (selectedSupport != null) {
+                        if (settings.developerModeEnabled && selectedSupport != null) {
                             StatusPill(
                                 label = "${settings.speechLanguage.code}: ${selectedSupport.label}",
                                 color = when (selectedSupport) {
@@ -278,14 +406,6 @@ fun SettingsScreen(
                                 }
                             )
                         }
-                    }
-                    voiceState.servicePackageName?.let { pkg ->
-                        Spacer(Modifier.height(4.dp))
-                        Text(
-                            text = "Active Recognition Provider: $pkg",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
                     }
                     Spacer(Modifier.height(8.dp))
                     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -313,11 +433,19 @@ fun SettingsScreen(
 
                     voiceState.missingPackWarning?.let { warn ->
                         Spacer(Modifier.height(6.dp))
-                        Text(warn, style = MaterialTheme.typography.bodySmall, color = AmberWarning)
+                        Text(
+                            text = sanitizeUiDiagnostics(warn, settings.developerModeEnabled),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = AmberWarning
+                        )
                     }
                     voiceState.modelDownloadStatus?.let { dlMsg ->
                         Spacer(Modifier.height(4.dp))
-                        Text(dlMsg, style = MaterialTheme.typography.bodySmall, color = ElectricCyan)
+                        Text(
+                            text = sanitizeUiDiagnostics(dlMsg, settings.developerModeEnabled),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = ElectricCyan
+                        )
                     }
                     Spacer(Modifier.height(6.dp))
                     Row(
@@ -342,7 +470,7 @@ fun SettingsScreen(
                         onClick = { viewModel.refreshSpeechCapabilities() },
                         modifier = Modifier.fillMaxWidth()
                     ) {
-                        Text("Re-check Speech Service Support")
+                        Text("Refresh Voice Support")
                     }
 
                     Spacer(Modifier.height(10.dp))
@@ -391,7 +519,7 @@ fun SettingsScreen(
                     ) {
                         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             Icon(Icons.Default.Security, contentDescription = null, tint = ElectricCyan)
-                            Text("Permission & Security Center", style = MaterialTheme.typography.titleMedium)
+                            Text("Permissions", style = MaterialTheme.typography.titleMedium)
                         }
                         OutlinedButton(
                             onClick = { viewModel.refreshPermissions() },
@@ -426,7 +554,7 @@ fun SettingsScreen(
 
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                         PermissionRow(
-                            title = "Exact Reminder Alarms",
+                            title = "Exact Alarms",
                             granted = permStatus.exactAlarmGranted,
                             permanentlyDenied = false,
                             actionLabel = if (permStatus.exactAlarmGranted) "Review" else "Allow"
@@ -435,16 +563,35 @@ fun SettingsScreen(
                         }
                     }
 
-                    PermissionRow("Accessibility Automation", permStatus.accessibilityEnabled) {
+                    val cameraPermDenied = isPermanentlyDenied(Manifest.permission.CAMERA, permStatus.cameraGranted)
+                    PermissionRow(
+                        title = "Camera",
+                        granted = permStatus.cameraGranted,
+                        permanentlyDenied = cameraPermDenied
+                    ) {
+                        if (cameraPermDenied) viewModel.openAppSettings()
+                        else permLauncher.launch(arrayOf(Manifest.permission.CAMERA))
+                    }
+
+                    PermissionRow(
+                        title = "Notification Access",
+                        granted = permStatus.notificationListenerGranted,
+                        permanentlyDenied = false,
+                        actionLabel = if (permStatus.notificationListenerGranted) "Review" else "Allow"
+                    ) {
+                        viewModel.openNotificationAccessSettings()
+                    }
+
+                    PermissionRow("Accessibility", permStatus.accessibilityEnabled) {
                         viewModel.openAccessibilitySettings()
                     }
-                    PermissionRow("Modify Brightness (Write Settings)", permStatus.writeSettingsGranted) {
+                    PermissionRow("System Settings", permStatus.writeSettingsGranted) {
                         viewModel.openWriteSettings()
                     }
 
                     val contactsPermDenied = isPermanentlyDenied(Manifest.permission.READ_CONTACTS, permStatus.contactsGranted)
                     PermissionRow(
-                        title = "Contacts (Drafting & Lookup)",
+                        title = "Contacts",
                         granted = permStatus.contactsGranted,
                         permanentlyDenied = contactsPermDenied
                     ) {
@@ -454,7 +601,7 @@ fun SettingsScreen(
 
                     val calendarPermDenied = isPermanentlyDenied(Manifest.permission.WRITE_CALENDAR, permStatus.calendarGranted)
                     PermissionRow(
-                        title = "Calendar Events",
+                        title = "Calendar",
                         granted = permStatus.calendarGranted,
                         permanentlyDenied = calendarPermDenied
                     ) {
@@ -464,26 +611,31 @@ fun SettingsScreen(
 
                     Spacer(Modifier.height(6.dp))
                     Button(onClick = onRequestScreenCapture, modifier = Modifier.fillMaxWidth()) {
-                        Text("Trigger Local Screen Capture Consent")
+                        Text("Allow Screen Capture")
                     }
                 }
             }
 
-            // Privacy & Zero-API-Key Policy Pledge
+            // Concise Privacy Summary & Developer / Debug Mode Toggle
             item {
                 GlassCard(accentBorder = EmeraldSuccess.copy(alpha = 0.6f)) {
                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         Icon(Icons.Default.Lock, contentDescription = null, tint = EmeraldSuccess)
-                        Text("Privacy & Zero-API-Key Architecture", style = MaterialTheme.typography.titleMedium)
+                        Text("On-Device Privacy & Advanced", style = MaterialTheme.typography.titleMedium)
                     }
                     Spacer(Modifier.height(6.dp))
                     Text(
-                        text = "• No Gemini, OpenAI, OpenRouter, or paid LLM API keys.\n" +
-                            "• No screenshots, voice audio, or command history ever leave your device.\n" +
-                            "• Messaging, profile updates, and file actions require explicit confirmation.\n" +
-                            "• Never executes arbitrary AI-generated code.",
+                        text = "Voice audio, screenshots, personal memory, and command history stay on your device. Sensitive actions require your confirmation.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    SettingSwitchRow(
+                        title = "Developer / Debug Mode",
+                        subtitle = "Show technical diagnostics, ABI/RAM telemetry, locale codes, and tool schemas",
+                        checked = settings.developerModeEnabled,
+                        onCheckedChange = { viewModel.setDeveloperModeEnabled(it) },
+                        switchModifier = Modifier.testTag("developer_mode_switch")
                     )
                 }
             }
@@ -502,7 +654,8 @@ private fun SettingSwitchRow(
     title: String,
     subtitle: String,
     checked: Boolean,
-    onCheckedChange: (Boolean) -> Unit
+    onCheckedChange: (Boolean) -> Unit,
+    switchModifier: Modifier = Modifier
 ) {
     Row(
         modifier = Modifier.fillMaxWidth(),
@@ -513,7 +666,11 @@ private fun SettingSwitchRow(
             Text(title, style = MaterialTheme.typography.titleSmall)
             Text(subtitle, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
-        Switch(checked = checked, onCheckedChange = onCheckedChange)
+        Switch(
+            checked = checked,
+            onCheckedChange = onCheckedChange,
+            modifier = switchModifier
+        )
     }
 }
 

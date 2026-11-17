@@ -32,16 +32,22 @@ import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.filled.AutoAwesome
+import androidx.compose.material.icons.filled.Bookmark
+import androidx.compose.material.icons.filled.CameraAlt
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.CloudOff
 import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.filled.NotificationsActive
 import androidx.compose.material.icons.filled.Replay
 import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.Translate
 import androidx.compose.material.icons.filled.VerifiedUser
 import androidx.compose.material.icons.filled.Warning
+import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.AssistChipDefaults
@@ -88,6 +94,7 @@ import com.example.ui.animations.AnimatedStageIndicator
 import com.example.ui.animations.CommanderAiOrb
 import com.example.ui.components.GlassCard
 import com.example.ui.components.StatusPill
+import com.example.ui.components.sanitizeUiDiagnostics
 import com.example.ui.components.statusColor
 import com.example.ui.theme.AmberWarning
 import com.example.ui.theme.CrimsonAlert
@@ -105,6 +112,8 @@ fun DashboardScreen(
     onRequestScreenCapture: () -> Unit,
     onNavigateToModels: () -> Unit,
     onNavigateToSettings: () -> Unit,
+    onNavigateToHub: (Int) -> Unit = {},
+    onNavigateToCamera: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -112,6 +121,8 @@ fun DashboardScreen(
     val modelState by viewModel.modelRuntimeState.collectAsStateWithLifecycle()
     val voiceState by viewModel.voiceListeningState.collectAsStateWithLifecycle()
     val settings by viewModel.settings.collectAsStateWithLifecycle()
+    val networkStatus by viewModel.networkStatus.collectAsStateWithLifecycle()
+    val isFollowUpActive by viewModel.isFollowUpWindowActive.collectAsStateWithLifecycle()
     val wakeRunning by viewModel.wakeWordServiceRunning.collectAsStateWithLifecycle()
     val wakeMicLevel by viewModel.wakeWordMicLevel.collectAsStateWithLifecycle()
     val wakeBanner by viewModel.wakeBannerMessage.collectAsStateWithLifecycle()
@@ -124,7 +135,7 @@ fun DashboardScreen(
 
     LaunchedEffect(execState.currentCommand, execState.finalStatus) {
         if (execState.pipelineStage != PipelineStage.IDLE || execState.finalReply.isNotBlank()) {
-            listState.animateScrollToItem(3)
+            listState.animateScrollToItem(4)
         }
     }
 
@@ -188,17 +199,10 @@ fun DashboardScreen(
                 )
             },
             text = {
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text(
-                        text = pending.previewBody,
-                        style = MaterialTheme.typography.bodyLarge
-                    )
-                    Text(
-                        text = "Tools: ${pending.plan.toolCalls.joinToString { it.tool }}",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
+                Text(
+                    text = pending.previewBody,
+                    style = MaterialTheme.typography.bodyLarge
+                )
             },
             confirmButton = {
                 Button(
@@ -257,13 +261,13 @@ fun DashboardScreen(
                             )
                             Column {
                                 Text(
-                                    text = "AI PHONE COMMANDER",
+                                    text = "AI Commander",
                                     style = MaterialTheme.typography.titleMedium,
                                     fontWeight = FontWeight.Bold,
                                     color = MaterialTheme.colorScheme.onBackground
                                 )
                                 Text(
-                                    text = "100% On-Device • Zero API Keys",
+                                    text = "Personal Assistant",
                                     style = MaterialTheme.typography.labelSmall,
                                     color = ElectricCyan
                                 )
@@ -271,9 +275,9 @@ fun DashboardScreen(
                         }
 
                         val statusLabel = when {
-                            modelState.isLoading -> "Loading AI…"
-                            modelState.isReady && !settings.commandOnlyMode -> "${modelState.backendUsed} LLM"
-                            else -> "Deterministic"
+                            modelState.isLoading -> "Loading…"
+                            modelState.isReady && !settings.commandOnlyMode -> "Local AI"
+                            else -> "Ready"
                         }
                         val statusColor = when {
                             modelState.isReady && !settings.commandOnlyMode -> EmeraldSuccess
@@ -291,7 +295,7 @@ fun DashboardScreen(
                     }
                 }
 
-                // Wake word & Greeting Banner
+                // Wake Word Status Card
                 item {
                     GlassCard(
                         accentBorder = if (wakeRunning) ElectricCyan.copy(alpha = 0.7f) else GlassBorder.copy(alpha = 0.5f),
@@ -304,15 +308,12 @@ fun DashboardScreen(
                         ) {
                             Column(modifier = Modifier.weight(1f)) {
                                 Text(
-                                    text = wakeBanner ?: when {
-                                        wakeRunning -> "Waiting for \"Hello Buddy\""
-                                        else -> "Ready. Say or type any phone command."
-                                    },
+                                    text = wakeBanner ?: if (wakeRunning) "Wake word: Active" else "Wake word: Off",
                                     style = MaterialTheme.typography.titleSmall,
                                     color = if (wakeRunning) ElectricCyan else MaterialTheme.colorScheme.onSurface
                                 )
                                 Text(
-                                    text = "Language: ${settings.speechLanguage.displayName} • ${if (wakeRunning) "Wake word active" else "Wake word off"}",
+                                    text = settings.speechLanguage.displayName,
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
@@ -321,7 +322,7 @@ fun DashboardScreen(
                                 onClick = onNavigateToSettings,
                                 modifier = Modifier.minimumInteractiveComponentSize()
                             ) {
-                                Text(if (wakeRunning) "Wake Settings" else "Enable Wake")
+                                Text("Settings")
                             }
                         }
                     }
@@ -341,41 +342,92 @@ fun DashboardScreen(
                         )
                         Spacer(Modifier.height(6.dp))
                         val orbLabel = when {
-                            voiceState.isStarting -> "Connecting speech service (${voiceState.backendMode.label})…"
-                            effectiveOrbState == OrbState.LISTENING -> "Listening… ${voiceState.durationMs / 1000}s"
-                            effectiveOrbState == OrbState.WAKE_WORD_WAITING -> "Listening locally for \"Hello Buddy\""
-                            effectiveOrbState == OrbState.WAKE_WORD_DETECTED -> "Hello Buddy detected!"
-                            effectiveOrbState == OrbState.THINKING -> "Local AI planning action…"
-                            effectiveOrbState == OrbState.PROCESSING -> "Understanding command…"
-                            effectiveOrbState == OrbState.EXECUTING -> "Executing ${execState.activeToolName}…"
-                            effectiveOrbState == OrbState.SPEAKING -> "Speaking response…"
-                            effectiveOrbState == OrbState.SUCCESS -> "Verified & Completed"
-                            effectiveOrbState == OrbState.ERROR -> "Voice / Execution Attention Needed"
-                            else -> "Tap Orb to Speak"
+                            voiceState.isStarting -> "Connecting voice…"
+                            effectiveOrbState == OrbState.LISTENING -> "Listening…"
+                            effectiveOrbState == OrbState.WAKE_WORD_WAITING -> "Say \"Hello Buddy\""
+                            effectiveOrbState == OrbState.WAKE_WORD_DETECTED -> "Hello Buddy heard"
+                            effectiveOrbState == OrbState.THINKING -> "Thinking…"
+                            effectiveOrbState == OrbState.PROCESSING -> "Processing…"
+                            effectiveOrbState == OrbState.EXECUTING -> "Running action…"
+                            effectiveOrbState == OrbState.SPEAKING -> "Speaking…"
+                            effectiveOrbState == OrbState.SUCCESS -> "Done"
+                            effectiveOrbState == OrbState.ERROR -> "Needs attention"
+                            else -> "Tap to speak"
                         }
                         Text(
                             text = orbLabel,
                             style = MaterialTheme.typography.labelLarge,
                             color = if (effectiveOrbState == OrbState.ERROR && voiceState.error != null) CrimsonAlert else ElectricCyan
                         )
+                    }
+                }
 
-                        Spacer(Modifier.height(6.dp))
-                        Row(
-                            horizontalArrangement = Arrangement.spacedBy(8.dp),
-                            verticalAlignment = Alignment.CenterVertically
+                // Speech backend & Network telemetry pills
+                item {
+                    Column(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalAlignment = Alignment.CenterHorizontally
+                    ) {
+                        Box(
+                            modifier = Modifier.fillMaxWidth(),
+                            contentAlignment = Alignment.Center
                         ) {
-                            StatusPill(
-                                label = "Speech: ${voiceState.backendMode.label}",
-                                color = if (voiceState.isRecognitionAvailable) EmeraldSuccess else AmberWarning,
-                                modifier = Modifier.testTag("speech_backend_pill")
-                            )
-                            voiceState.detectedSpokenLocale?.takeIf { it.isNotBlank() }?.let { loc ->
+                            Row(
+                                modifier = Modifier.horizontalScroll(rememberScrollState()),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
                                 StatusPill(
-                                    label = "Spoken: $loc",
-                                    color = NeuralViolet,
-                                    modifier = Modifier.testTag("spoken_locale_pill")
+                                    label = if (settings.developerModeEnabled) {
+                                        "Speech: ${voiceState.backendMode.label}"
+                                    } else if (voiceState.isRecognitionAvailable) {
+                                        "Voice Ready"
+                                    } else {
+                                        "Voice Setup Needed"
+                                    },
+                                    color = if (voiceState.isRecognitionAvailable) EmeraldSuccess else AmberWarning,
+                                    modifier = Modifier.testTag("speech_backend_pill")
                                 )
+                                StatusPill(
+                                    label = when {
+                                        settings.offlineStrictMode -> "Offline Strict"
+                                        networkStatus.isOnline -> networkStatus.transportLabel
+                                        else -> "Offline Mode"
+                                    },
+                                    color = when {
+                                        settings.offlineStrictMode -> NeuralViolet
+                                        networkStatus.isOnline -> EmeraldSuccess
+                                        else -> AmberWarning
+                                    },
+                                    icon = if (!settings.offlineStrictMode && networkStatus.isOnline) Icons.Default.Wifi else Icons.Default.CloudOff,
+                                    modifier = Modifier.testTag("network_status_pill")
+                                )
+                                if (settings.developerModeEnabled) {
+                                    voiceState.detectedSpokenLocale?.takeIf { it.isNotBlank() }?.let { loc ->
+                                        StatusPill(
+                                            label = "Spoken: $loc",
+                                            color = NeuralViolet,
+                                            modifier = Modifier.testTag("spoken_locale_pill")
+                                        )
+                                    }
+                                }
                             }
+                        }
+
+                        if (isFollowUpActive || ttsSpeaking) {
+                            Spacer(Modifier.height(6.dp))
+                            AssistChip(
+                                onClick = { viewModel.stopContinuousVoiceSession() },
+                                label = { Text(if (ttsSpeaking) "Stop Speaking" else "Stop Follow-up Voice") },
+                                leadingIcon = { Icon(Icons.Default.Stop, contentDescription = null, modifier = Modifier.size(16.dp)) },
+                                colors = AssistChipDefaults.assistChipColors(
+                                    containerColor = CrimsonAlert.copy(alpha = 0.2f),
+                                    labelColor = CrimsonAlert,
+                                    leadingIconContentColor = CrimsonAlert
+                                ),
+                                border = BorderStroke(1.dp, CrimsonAlert.copy(alpha = 0.6f)),
+                                modifier = Modifier.testTag("stop_voice_session_chip")
+                            )
                         }
 
                         // Active listening transcript & controls
@@ -440,7 +492,7 @@ fun DashboardScreen(
                                             modifier = Modifier.size(20.dp)
                                         )
                                         Text(
-                                            text = voiceErr,
+                                            text = sanitizeUiDiagnostics(voiceErr, settings.developerModeEnabled),
                                             style = MaterialTheme.typography.bodySmall,
                                             color = MaterialTheme.colorScheme.onSurface
                                         )
@@ -489,7 +541,7 @@ fun DashboardScreen(
                             ) {
                                 if (execState.currentCommand.isNotBlank()) {
                                     Text(
-                                        text = "COMMAND: ${execState.currentCommand}",
+                                        text = execState.currentCommand,
                                         style = MaterialTheme.typography.labelMedium,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                                         modifier = Modifier.weight(1f),
@@ -557,30 +609,11 @@ fun DashboardScreen(
                                 }
                             }
 
-                            // Step-by-step verification notes
+                            // Actionable recovery & extracted context (hide internal tool/verification telemetry)
                             if (execState.stepResults.isNotEmpty()) {
-                                Spacer(Modifier.height(10.dp))
                                 execState.stepResults.forEach { step ->
-                                    Row(
-                                        modifier = Modifier
-                                            .fillMaxWidth()
-                                            .padding(vertical = 2.dp),
-                                        horizontalArrangement = Arrangement.SpaceBetween,
-                                        verticalAlignment = Alignment.CenterVertically
-                                    ) {
-                                        Text(
-                                            text = "${step.toolName} • ${step.verificationNote}",
-                                            style = MaterialTheme.typography.labelSmall,
-                                            color = statusColor(step.status),
-                                            modifier = Modifier.weight(1f),
-                                            maxLines = 2,
-                                            overflow = TextOverflow.Ellipsis
-                                        )
-                                    }
-
-                                    // Contextual extracted screen data if available
                                     step.data["extracted_text"]?.takeIf { it.isNotBlank() }?.let { extracted ->
-                                        Spacer(Modifier.height(6.dp))
+                                        Spacer(Modifier.height(8.dp))
                                         Surface(
                                             shape = RoundedCornerShape(12.dp),
                                             color = DeepSpaceBlack.copy(alpha = 0.7f),
@@ -637,24 +670,63 @@ fun DashboardScreen(
                     }
                 }
 
-                // Quick Automation Chips (English + Indic Multilingual + Multi-step)
+                // Assistant Smart Hub & Vision Shortcuts
+                item {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        AssistChip(
+                            onClick = onNavigateToCamera,
+                            label = { Text("Camera AI") },
+                            leadingIcon = { Icon(Icons.Default.CameraAlt, contentDescription = null, modifier = Modifier.size(16.dp)) },
+                            colors = AssistChipDefaults.assistChipColors(containerColor = ElevatedNavy, labelColor = ElectricCyan),
+                            border = BorderStroke(1.dp, ElectricCyan.copy(alpha = 0.5f)),
+                            modifier = Modifier.testTag("hub_shortcut_camera")
+                        )
+                        AssistChip(
+                            onClick = { onNavigateToHub(0) },
+                            label = { Text("Memory") },
+                            leadingIcon = { Icon(Icons.Default.Bookmark, contentDescription = null, modifier = Modifier.size(16.dp)) },
+                            colors = AssistChipDefaults.assistChipColors(containerColor = ElevatedNavy, labelColor = MaterialTheme.colorScheme.onSurface),
+                            border = BorderStroke(1.dp, GlassBorder),
+                            modifier = Modifier.testTag("hub_shortcut_memory")
+                        )
+                        AssistChip(
+                            onClick = { onNavigateToHub(1) },
+                            label = { Text("Routines") },
+                            leadingIcon = { Icon(Icons.Default.AutoAwesome, contentDescription = null, modifier = Modifier.size(16.dp)) },
+                            colors = AssistChipDefaults.assistChipColors(containerColor = ElevatedNavy, labelColor = MaterialTheme.colorScheme.onSurface),
+                            border = BorderStroke(1.dp, GlassBorder),
+                            modifier = Modifier.testTag("hub_shortcut_routines")
+                        )
+                        AssistChip(
+                            onClick = { onNavigateToHub(2) },
+                            label = { Text("Alerts") },
+                            leadingIcon = { Icon(Icons.Default.NotificationsActive, contentDescription = null, modifier = Modifier.size(16.dp)) },
+                            colors = AssistChipDefaults.assistChipColors(containerColor = ElevatedNavy, labelColor = MaterialTheme.colorScheme.onSurface),
+                            border = BorderStroke(1.dp, GlassBorder),
+                            modifier = Modifier.testTag("hub_shortcut_alerts")
+                        )
+                    }
+                }
+
+                // Concise Quick Commands
                 item {
                     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         Text(
-                            text = "QUICK COMMANDS (MULTILINGUAL)",
+                            text = "Try saying",
                             style = MaterialTheme.typography.labelMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                         val quickCommands = listOf(
                             "Open Chrome",
-                            "YouTube lo Java tutorials search chey",
-                            "YouTube पर AI videos search करो",
-                            "Chrome திற",
-                            "Open Bluetooth settings",
+                            "Battery status",
                             "Explain my screen",
-                            "Create a reminder Call Alex",
-                            "Open Naukri and search for SAP FICO jobs in Hyderabad",
-                            "Search files for resume"
+                            "Open Bluetooth settings",
+                            "Create a reminder Call Alex"
                         )
                         Row(
                             modifier = Modifier.horizontalScroll(rememberScrollState()),
@@ -682,16 +754,20 @@ fun DashboardScreen(
                     }
                 }
 
-                // Recent Commands
+                // Recent Commands (deduplicated against currently shown command card)
+                val visibleRecent = recentCommands.filterNot {
+                    execState.finalReply.isNotBlank() &&
+                        it.commandText.equals(execState.currentCommand, ignoreCase = true)
+                }
                 item {
                     Text(
-                        text = "RECENT COMMANDS",
+                        text = "Recent",
                         style = MaterialTheme.typography.labelMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
 
-                if (recentCommands.isEmpty()) {
+                if (visibleRecent.isEmpty()) {
                     item {
                         GlassCard {
                             Row(
@@ -704,7 +780,7 @@ fun DashboardScreen(
                                     tint = ElectricCyan
                                 )
                                 Text(
-                                    text = "No commands executed yet. Tap the Orb or type a command below — everything runs locally on your phone.",
+                                    text = "Your recent commands will appear here.",
                                     style = MaterialTheme.typography.bodyMedium,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
@@ -712,7 +788,7 @@ fun DashboardScreen(
                         }
                     }
                 } else {
-                    items(recentCommands, key = { it.id }) { entry ->
+                    items(visibleRecent, key = { it.id }) { entry ->
                         val status = runCatching { ExecutionStatus.valueOf(entry.resultStatus) }
                             .getOrDefault(ExecutionStatus.FAILED)
                         GlassCard(
